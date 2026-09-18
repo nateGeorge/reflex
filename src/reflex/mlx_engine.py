@@ -1,4 +1,9 @@
-"""Text-only Qwen3 decisions on Apple Silicon, with bounded question-prefix caching."""
+"""Text-only Qwen decisions on Apple Silicon, with bounded question-prefix caching.
+
+Supports `qwen3` and `qwen3_5` architectures (including Qwen3.5 dense models).
+Other architectures (Spark, Llama, qwen4_exp/Flash-Next) need prompt-format
+and label-token work and are rejected at load.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +21,9 @@ from reflex.images import has_images
 from reflex.prompt import PromptFormat, build_branches, render_text
 from reflex.readout import Calibration, merge_branches, to_answer
 from reflex.schema import SystemOneRequest, SystemOneResponse, Text, Usage
+
+
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5"})
 
 
 @dataclass
@@ -38,8 +46,11 @@ class MLXEngine:
         calibration=None,
         max_pack_tokens=8192,
     ):
-        if model.model_type != "qwen3":
-            raise ValueError("MLX backend supports text-only Qwen3 models")
+        if model.model_type not in SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"MLX backend supports {sorted(SUPPORTED_MODEL_TYPES)} models, "
+                f"got {model.model_type!r}"
+            )
         model.eval()
         # Materialize weights before FastAPI moves inference to worker threads.
         mx.eval(model.parameters())
@@ -58,8 +69,12 @@ class MLXEngine:
             raise RuntimeError("MLX backend needs an Apple Silicon GPU")
         mx.set_default_device(mx.gpu)
         model, tokenizer, config = load(model_id, return_config=True)
-        if config.get("model_type") != "qwen3":
-            raise ValueError("MLX backend supports text-only Qwen3 models")
+        model_type = config.get("model_type")
+        if model_type not in SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"MLX backend supports {sorted(SUPPORTED_MODEL_TYPES)} models, "
+                f"got {model_type!r}"
+            )
         if not config.get("quantization"):
             nn.quantize(model, bits=4, group_size=64)
         return cls(
