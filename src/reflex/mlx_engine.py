@@ -1,6 +1,6 @@
 """Text-only Qwen decisions on Apple Silicon, with bounded question-prefix caching.
 
-Supports `qwen3` and `qwen3_5` architectures (including Qwen3.5 dense models).
+Supports `qwen3`, `qwen3_5`, and `llama` (ChatML-marker) architectures.
 Other architectures (Spark, Llama, qwen4_exp/Flash-Next) need prompt-format
 and label-token work and are rejected at load.
 """
@@ -23,7 +23,7 @@ from reflex.readout import Calibration, merge_branches, to_answer
 from reflex.schema import SystemOneRequest, SystemOneResponse, Text, Usage
 
 
-SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5"})
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5", "llama"})
 
 
 @dataclass
