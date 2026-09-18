@@ -51,9 +51,14 @@ class MLXEngine:
                 f"MLX backend supports {sorted(SUPPORTED_MODEL_TYPES)} models, "
                 f"got {model.model_type!r}"
             )
+        # Some mlx-lm architectures (e.g. qwen3_5) wrap the text model in a
+        # multimodal container exposing it as ``language_model``. Unwrap once
+        # so readout works against the same interface for all archs.
+        core = getattr(model, "language_model", model)
+        self.core = core
         model.eval()
         # Materialize weights before FastAPI moves inference to worker threads.
-        mx.eval(model.parameters())
+        mx.eval(core.parameters())
         self.model = model
         self.tok = tokenizer
         self.model_name = model_name
@@ -97,12 +102,12 @@ class MLXEngine:
         # Leave a token to evaluate even when the cache already contains the whole prompt.
         cache, rest = self.cache.fetch_nearest_cache(self.model_name, ids[:-1])
         if cache is None:
-            cache = make_prompt_cache(self.model)
-        hidden = self.model.model(mx.array(rest + ids[-1:])[None], cache=cache)[:, -1:, :]
-        if self.model.args.tie_word_embeddings:
-            logits = self.model.model.embed_tokens.as_linear(hidden)
+            cache = make_prompt_cache(self.core)
+        hidden = self.core.model(mx.array(rest + ids[-1:])[None], cache=cache)[:, -1:, :]
+        if self.core.args.tie_word_embeddings:
+            logits = self.core.model.embed_tokens.as_linear(hidden)
         else:
-            logits = self.model.lm_head(hidden)
+            logits = self.core.lm_head(hidden)
         restricted = logits[0, -1, label_ids].astype(mx.float32)
         mx.eval(restricted, [c.state for c in cache])
         self.cache.insert_cache(self.model_name, ids, cache)
