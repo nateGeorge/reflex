@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from pathlib import Path
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -53,27 +54,44 @@ def create_app(engine) -> FastAPI:
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--model", default=None)
     ap.add_argument("--adapter", default=None, help="LoRA adapter dir from reflex-calibrate")
     ap.add_argument("--calibration", default=None, help="calibration.json (temperatures)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8008)
     ap.add_argument("--max-pack-tokens", type=int, default=8192)
-    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    ap.add_argument("--backend", choices=["torch", "mlx"], default="torch")
+    ap.add_argument("--warmup", help="SystemOne request JSON to evaluate before accepting traffic")
+    ap.add_argument("--dtype", default=None, choices=["bfloat16", "float16", "float32"])
+    ap.add_argument("--device", default=None, help="torch device_map (cuda, mps, cpu)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     import uvicorn
 
-    from reflex.engine import Engine
+    if args.backend == "mlx":
+        if args.adapter or args.dtype or args.device:
+            ap.error("--adapter, --dtype and --device apply only to the torch backend")
+        from reflex.mlx_engine import MLXEngine
 
-    engine = Engine.load(
-        args.model,
-        dtype=getattr(torch, args.dtype),
-        calibration_path=args.calibration,
-        adapter_path=args.adapter,
-        max_pack_tokens=args.max_pack_tokens,
-    )
+        engine = MLXEngine.load(
+            args.model or "Qwen/Qwen3-4B",
+            calibration_path=args.calibration,
+            max_pack_tokens=args.max_pack_tokens,
+        )
+    else:
+        from reflex.engine import Engine
+
+        engine = Engine.load(
+            args.model or "Qwen/Qwen3.5-4B",
+            device=args.device or "cuda",
+            dtype=getattr(torch, args.dtype or "bfloat16"),
+            calibration_path=args.calibration,
+            adapter_path=args.adapter,
+            max_pack_tokens=args.max_pack_tokens,
+        )
+    if args.warmup:
+        engine.answer(SystemOneRequest.model_validate_json(Path(args.warmup).read_text()))
     uvicorn.run(create_app(engine), host=args.host, port=args.port, log_level="warning")
 
 

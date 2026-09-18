@@ -66,6 +66,30 @@ Try it on a photo:
 uv run python examples/image_triage.py path/to/photo.jpg --caption "two cats on a couch"
 ```
 
+### Apple Silicon (MLX)
+
+```bash
+uv sync --extra mlx
+uv run reflex-serve --backend mlx --model Qwen/Qwen3-4B --port 8008
+```
+
+The MLX backend supports text-only Qwen3 models on the Mac GPU. It quantizes
+unquantized weights to 4-bit; pre-quantized MLX checkpoints keep their precision.
+It places fixed questions before the variable state, caches matching token prefixes
+(up to eight entries / 128 MiB), and reads label logits without generating text.
+This prompt layout can change probabilities; check accuracy on your own inputs.
+
+Questions and permutations run serially, not in the Torch backend's packed batch.
+Use `--warmup request.json` with a representative SystemOne request to load GPU
+kernels and cache its question prefix before the server accepts traffic.
+Long states and uncached questions still cost a full prefill. The response schema
+stays the same. `state_cache_hit` stays false because this cache reuses question
+prefixes; token counts include each branch's state. Images return HTTP 422.
+`--adapter`, `--dtype`, and `--device` apply only to Torch. The default backend
+remains Torch. The server binds to localhost unless `--host` overrides it.
+
+Run the download-free MLX tests with `uv run --extra mlx --extra dev pytest tests/test_mlx_engine.py`.
+
 ### Ask your own questions
 
 ```python
