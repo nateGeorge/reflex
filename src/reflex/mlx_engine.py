@@ -1,7 +1,7 @@
 """Text-only decisions on Apple Silicon, with bounded question-prefix caching.
 
 Supports ChatML-marker architectures (`qwen3`, `qwen3_5`, `llama`) plus
-`spark2_5`, which uses its own sentence markers. Other architectures
+`spark2_5` (sentence markers) and `mistral3`/`ministral3` (`[INST]` markers). Other architectures
 (qwen4_exp/Flash-Next) need prompt-format and label-token work and are
 rejected at load.
 
@@ -58,7 +58,7 @@ class _DirectTokenizer:
         return self._tok.decode(ids)
 
 
-SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5", "llama", "spark2_5"})
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5", "llama", "spark2_5", "mistral3", "ministral3"})
 
 # Spark sentence markers. Bars are U+FF5C FULLWIDTH VERTICAL LINE, blanks are
 # U+2581 LOWER ONE EIGHTH BLOCK. Copy verbatim; verified against the decoded
@@ -111,6 +111,17 @@ class QuestionFirstFormat(PromptFormat):
         if self.no_think and self.think_close:
             tail += self.think_close
         return prefix + body + tail
+
+
+@dataclass
+class MistralFirstFormat(QuestionFirstFormat):
+    """Ministral/Mistral `[INST]` layout. Generation starts right after `[/INST]`."""
+
+    system_head: str = "<s>[SYSTEM_PROMPT]"
+    system_tail: str = "[/SYSTEM_PROMPT]"
+    user_head: str = "[INST]\n"
+    assistant_tail: str = "[/INST]"
+    think_close: str = ""
 
 
 @dataclass
@@ -214,7 +225,12 @@ class MLXEngine:
     def _answer(self, req):
         if has_images(req.state):
             raise ValueError("state contains images but the loaded model is text-only")
-        fmt_cls = SparkFirstFormat if self.model_type == "spark2_5" else QuestionFirstFormat
+        if self.model_type.startswith("mistral") or self.model_type.startswith("ministral"):
+            fmt_cls = MistralFirstFormat
+        elif self.model_type == "spark2_5":
+            fmt_cls = SparkFirstFormat
+        else:
+            fmt_cls = QuestionFirstFormat
         fmt = fmt_cls(
             state=req.state,
             no_think="enable_thinking" in (self.tok.chat_template or ""),
