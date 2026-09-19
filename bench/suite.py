@@ -281,7 +281,7 @@ def main():
             # anything else on the machine do not pile up into swap.
             import mlx.core as mx
 
-            mx.metal.clear_cache()
+            mx.clear_cache()
     print("wrote", args.out, flush=True)
 
 
