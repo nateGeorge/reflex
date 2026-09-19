@@ -103,7 +103,7 @@ def nll(probs, idx, t):
 
 
 def fit(samples):
-    grid = [round(0.25 + 0.05 * i, 2) for i in range(76)]
+    grid = [round(0.25 + 0.05 * i, 2) for i in range(156)]
     by_kind: dict[str, list] = {}
     for kind, probs, idx in samples:
         by_kind.setdefault(kind, []).append((probs, idx))
