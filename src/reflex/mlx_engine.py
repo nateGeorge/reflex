@@ -1,8 +1,13 @@
-"""Text-only Qwen decisions on Apple Silicon, with bounded question-prefix caching.
+"""Text-only decisions on Apple Silicon, with bounded question-prefix caching.
 
-Supports `qwen3`, `qwen3_5`, and `llama` (ChatML-marker) architectures.
-Other architectures (Spark, Llama, qwen4_exp/Flash-Next) need prompt-format
-and label-token work and are rejected at load.
+Supports ChatML-marker architectures (`qwen3`, `qwen3_5`, `llama`) plus
+`spark2_5`, which uses its own sentence markers. Other architectures
+(qwen4_exp/Flash-Next) need prompt-format and label-token work and are
+rejected at load.
+
+Loading passes ``trust_remote_code=True``: mlx-community quants such as
+Spark ship a custom tokenizer config that transformers refuses to run
+without it. Weights are local files; no remote code executes at inference.
 """
 
 from __future__ import annotations
@@ -23,17 +28,100 @@ from reflex.readout import Calibration, merge_branches, to_answer
 from reflex.schema import SystemOneRequest, SystemOneResponse, Text, Usage
 
 
-SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5", "llama"})
+class _DirectTokenizer:
+    """Minimal tokenizer loaded straight from ``tokenizer.json``.
+
+    Fallback for checkpoints whose custom transformers config crashes
+    ``AutoTokenizer`` (e.g. Spark's ``configuration_spark.py`` under
+    transformers>=5 rope validation). Exposes the ``encode`` /
+    ``chat_template`` surface the backend uses.
+    """
+
+    def __init__(self, path):
+        import json as _json
+
+        from tokenizers import Tokenizer
+
+        self._tok = Tokenizer.from_file(str(path / "tokenizer.json"))
+        template_file = path / "chat_template.jinja"
+        if template_file.exists():
+            self.chat_template = template_file.read_text()
+        else:
+            self.chat_template = _json.loads(
+                (path / "tokenizer_config.json").read_text()
+            ).get("chat_template")
+
+    def encode(self, text, add_special_tokens=False):
+        return self._tok.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def decode(self, ids):
+        return self._tok.decode(ids)
+
+
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5", "llama", "spark2_5"})
+
+# Spark sentence markers. Bars are U+FF5C FULLWIDTH VERTICAL LINE, blanks are
+# U+2581 LOWER ONE EIGHTH BLOCK. Copy verbatim; verified against the decoded
+# chat template output.
+SPARK_OPEN = "<｜start▁of▁sentence｜>"
+SPARK_CLOSE = "<｜end▁of▁sentence｜>"
+
+
+def _load_trusted(model_id):
+    """Load weights plus tokenizer, tolerating custom-config checkpoints."""
+    try:
+        return load(
+            model_id,
+            return_config=True,
+            trust_remote_code=True,
+            tokenizer_config={"trust_remote_code": True},
+        )
+    except Exception:
+        # Custom transformers configs (Spark) can fail AutoTokenizer
+        # validation while mlx-lm loads the same weights fine. Load each side
+        # directly instead of failing the whole model.
+        from pathlib import Path as _Path
+
+        from huggingface_hub import snapshot_download
+        from mlx_lm.utils import load_config, load_model
+
+        path = _Path(snapshot_download(model_id))
+        config = load_config(path)
+        model, _ = load_model(path, trust_remote_code=True)
+        return model, _DirectTokenizer(path), config
 
 
 @dataclass
 class QuestionFirstFormat(PromptFormat):
     state: Text = ""
 
+    system_head: str = "<|im_start|>system\n"
+    system_tail: str = "<|im_end|>\n"
+    user_head: str = "<|im_start|>user\n"
+    assistant_tail: str = "<|im_end|>\n<|im_start|>assistant\n"
+    think_close: str = "<think>\n\n</think>\n\n"
+
     def branch(self, body: str) -> str:
-        prefix = f"<|im_start|>system\n{self.system_prompt}<|im_end|>\n<|im_start|>user\n"
+        prefix = (
+            f"{self.system_head}{self.system_prompt}{self.system_tail}"
+            f"{self.user_head}"
+        )
         body += f"\n# State\n{render_text(self.state)}\n\nRespond with only the option label.\n"
-        return prefix + super().branch(body)
+        tail = self.assistant_tail
+        if self.no_think and self.think_close:
+            tail += self.think_close
+        return prefix + body + tail
+
+
+@dataclass
+class SparkFirstFormat(QuestionFirstFormat):
+    """Spark-X2.5 sentence-marker layout (thinking disabled)."""
+
+    system_head: str = SPARK_OPEN + "<|System|>\nyou are a helpful assistant.\n\n"
+    system_tail: str = SPARK_CLOSE
+    user_head: str = SPARK_OPEN + "<|User|>\n"
+    assistant_tail: str = SPARK_CLOSE + SPARK_OPEN + "<|Bot|>"
+    think_close: str = "</think>"
 
 
 class MLXEngine:
@@ -62,6 +150,7 @@ class MLXEngine:
         self.model = model
         self.tok = tokenizer
         self.model_name = model_name
+        self.model_type = model.model_type
         self.device = mx.default_device()
         self.cal = calibration or Calibration()
         self.max_pack_tokens = max_pack_tokens
@@ -73,7 +162,7 @@ class MLXEngine:
         if not mx.metal.is_available():
             raise RuntimeError("MLX backend needs an Apple Silicon GPU")
         mx.set_default_device(mx.gpu)
-        model, tokenizer, config = load(model_id, return_config=True)
+        model, tokenizer, config = _load_trusted(model_id)
         model_type = config.get("model_type")
         if model_type not in SUPPORTED_MODEL_TYPES:
             raise ValueError(
@@ -103,10 +192,15 @@ class MLXEngine:
         cache, rest = self.cache.fetch_nearest_cache(self.model_name, ids[:-1])
         if cache is None:
             cache = make_prompt_cache(self.core)
-        hidden = self.core.model(mx.array(rest + ids[-1:])[None], cache=cache)[:, -1:, :]
-        if self.core.args.tie_word_embeddings:
+        out = self.core(mx.array(rest + ids[-1:])[None], cache=cache)
+        if out.shape[-1] == self.core.args.vocab_size:
+            # Some architectures (spark2_5) return logits from __call__.
+            logits = out[:, -1:, :]
+        elif self.core.args.tie_word_embeddings:
+            hidden = hidden[:, -1:, :]
             logits = self.core.model.embed_tokens.as_linear(hidden)
         else:
+            hidden = hidden[:, -1:, :]
             logits = self.core.lm_head(hidden)
         restricted = logits[0, -1, label_ids].astype(mx.float32)
         mx.eval(restricted, [c.state for c in cache])
@@ -120,7 +214,8 @@ class MLXEngine:
     def _answer(self, req):
         if has_images(req.state):
             raise ValueError("state contains images but the loaded model is text-only")
-        fmt = QuestionFirstFormat(
+        fmt_cls = SparkFirstFormat if self.model_type == "spark2_5" else QuestionFirstFormat
+        fmt = fmt_cls(
             state=req.state,
             no_think="enable_thinking" in (self.tok.chat_template or ""),
         )
