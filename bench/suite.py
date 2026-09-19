@@ -169,7 +169,7 @@ def run_banking(engine, n: int, seed: int, perms: int):
 
 
 def run_sst2(engine, n: int, seed: int, perms: int):
-    rows = _parquet_rows("stanfordnlp/sst2", "data/test*.parquet")
+    rows = _parquet_rows("stanfordnlp/sst2", "data/validation*.parquet")
     rng = random.Random(seed)
     idx = rng.sample(range(len(rows)), min(n, len(rows)))
     out = []
