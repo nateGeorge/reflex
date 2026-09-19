@@ -102,11 +102,11 @@ def _banking_label_names():
     return meta["info"]["features"]["label"]["names"]
 
 
-def load_engine(model: str, backend: str):
+def load_engine(model: str, backend: str, calibration: str | None = None):
     if backend == "mlx":
         from reflex.mlx_engine import MLXEngine
 
-        return MLXEngine.load(model)
+        return MLXEngine.load(model, calibration_path=calibration)
     from reflex import Engine
 
     return Engine.load(model)
@@ -250,13 +250,15 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--permutations", type=int, default=1)
     ap.add_argument("--backend", default="mlx", choices=["mlx", "torch"])
+    ap.add_argument("--calibration", default=None)
     ap.add_argument("--skip", default="")
     args = ap.parse_args()
     skip = set(args.skip.split(",")) if args.skip else set()
 
-    engine = load_engine(args.model, args.backend)
+    engine = load_engine(args.model, args.backend, args.calibration)
     out = {"model": args.model, "backend": args.backend, "n": args.n,
-           "seed": args.seed, "permutations": args.permutations}
+           "seed": args.seed, "permutations": args.permutations,
+           "calibration": args.calibration}
     for name, fn in [("smoke", lambda: run_smoke(engine, args.permutations)),
                      ("banking", lambda: run_banking(engine, args.n, args.seed, args.permutations)),
                      ("sst2", lambda: run_sst2(engine, args.n, args.seed, args.permutations)),
