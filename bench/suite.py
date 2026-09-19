@@ -273,6 +273,13 @@ def main():
         else:
             print(f"[{name}] {rows}", flush=True)
         Path(args.out).write_text(json.dumps(out, indent=2))
+        if args.backend == "mlx":
+            # MLX Metal buffers grow to a high-water mark and are not
+            # returned promptly. Release between legs so long suites plus
+            # anything else on the machine do not pile up into swap.
+            import mlx.core as mx
+
+            mx.metal.clear_cache()
     print("wrote", args.out, flush=True)
 
 
