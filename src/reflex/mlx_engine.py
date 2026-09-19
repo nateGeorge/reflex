@@ -1,7 +1,8 @@
 """Text-only decisions on Apple Silicon, with bounded question-prefix caching.
 
-Supports ChatML-marker architectures (`qwen3`, `qwen3_5`, `llama`) plus
-`spark2_5` (sentence markers) and `mistral3`/`ministral3` (`[INST]` markers). Other architectures
+Supports ChatML-marker architectures (`qwen3`, `qwen3_5`, `llama`), plus
+`spark2_5` (sentence markers), `mistral3`/`ministral3` (`[INST]`), and
+`gemma3n` (`<start_of_turn>`). Other architectures
 (qwen4_exp/Flash-Next) need prompt-format and label-token work and are
 rejected at load.
 
@@ -58,7 +59,10 @@ class _DirectTokenizer:
         return self._tok.decode(ids)
 
 
-SUPPORTED_MODEL_TYPES = frozenset({"qwen3", "qwen3_5", "llama", "spark2_5", "mistral3", "ministral3"})
+SUPPORTED_MODEL_TYPES = frozenset({
+    "qwen3", "qwen3_5", "llama", "spark2_5",
+    "mistral3", "ministral3", "gemma3n",
+})
 
 # Spark sentence markers. Bars are U+FF5C FULLWIDTH VERTICAL LINE, blanks are
 # U+2581 LOWER ONE EIGHTH BLOCK. Copy verbatim; verified against the decoded
@@ -111,6 +115,18 @@ class QuestionFirstFormat(PromptFormat):
         if self.no_think and self.think_close:
             tail += self.think_close
         return prefix + body + tail
+
+
+@dataclass
+class GemmaFirstFormat(QuestionFirstFormat):
+    """Gemma `<start_of_turn>` layout. No system role: system text merges
+    into the user turn. Generation starts after `<start_of_turn>model`."""
+
+    system_head: str = "<bos><start_of_turn>user\n"
+    system_tail: str = "\n\n"
+    user_head: str = ""
+    assistant_tail: str = "<end_of_turn>\n<start_of_turn>model\n"
+    think_close: str = ""
 
 
 @dataclass
@@ -197,6 +213,13 @@ class MLXEngine:
                 raise ValueError(f"label {label!r} is not a single token: {tokens}")
         return mx.array([tokens[0] for tokens in ids])
 
+    def _vocab_size(self):
+        args = self.core.args
+        vocab = getattr(args, "vocab_size", None)
+        if vocab is None:
+            vocab = getattr(args, "text_config", {}).get("vocab_size")
+        return vocab
+
     def _logits(self, ids, labels):
         label_ids = self._label_ids(labels)
         # Leave a token to evaluate even when the cache already contains the whole prompt.
@@ -204,7 +227,7 @@ class MLXEngine:
         if cache is None:
             cache = make_prompt_cache(self.core)
         out = self.core(mx.array(rest + ids[-1:])[None], cache=cache)
-        if out.shape[-1] == self.core.args.vocab_size:
+        if out.shape[-1] == self._vocab_size():
             # Some architectures (spark2_5) return logits from __call__.
             logits = out[:, -1:, :]
         elif self.core.args.tie_word_embeddings:
@@ -225,7 +248,9 @@ class MLXEngine:
     def _answer(self, req):
         if has_images(req.state):
             raise ValueError("state contains images but the loaded model is text-only")
-        if self.model_type.startswith("mistral") or self.model_type.startswith("ministral"):
+        if self.model_type == "gemma3n":
+            fmt_cls = GemmaFirstFormat
+        elif self.model_type.startswith("mistral") or self.model_type.startswith("ministral"):
             fmt_cls = MistralFirstFormat
         elif self.model_type == "spark2_5":
             fmt_cls = SparkFirstFormat
