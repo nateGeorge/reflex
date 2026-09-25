@@ -16,6 +16,7 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
+from reflex.priority import PriorityLock, request_priority
 from reflex.schema import SystemOneRequest, SystemOneResponse
 
 log = logging.getLogger("reflex.server")
@@ -23,6 +24,10 @@ log = logging.getLogger("reflex.server")
 
 def create_app(engine) -> FastAPI:
     app = FastAPI(title="reflex", version="0.1.0")
+    # One model instance on one accelerator: requests are serialized either way,
+    # but cheapest-first, so an interactive 1-question call never waits out a
+    # multi-question batch. See reflex.priority.
+    gate = PriorityLock()
 
     @app.get("/healthz")
     def healthz():
@@ -30,9 +35,13 @@ def create_app(engine) -> FastAPI:
 
     @app.post("/v1/systemone", response_model=SystemOneResponse)
     def systemone(req: SystemOneRequest):
-        t0 = time.perf_counter()
+        queued_at = time.perf_counter()
+        wait_ms = 0.0
         try:
-            resp = engine.answer(req)
+            with gate.hold(request_priority(req)):
+                wait_ms = (time.perf_counter() - queued_at) * 1000
+                t0 = time.perf_counter()
+                resp = engine.answer(req)
         except ValueError as e:  # bad labels / too long
             raise HTTPException(status_code=422, detail=str(e))
         except torch.cuda.OutOfMemoryError:
@@ -40,14 +49,19 @@ def create_app(engine) -> FastAPI:
             raise HTTPException(status_code=529, detail="overloaded: request too large for GPU")
         ms = (time.perf_counter() - t0) * 1000
         log.info(
-            "%d questions, %d state tok (%s), %d q tok, %.0f ms",
+            "%d questions, %d state tok (%s), %d q tok, %.0f ms (queued %.0f ms)",
             len(req.questions),
             resp.usage.state_tokens,
             "hit" if resp.usage.state_cache_hit else "miss",
             resp.usage.question_tokens,
             ms,
+            wait_ms,
         )
-        return JSONResponse(resp.model_dump(), headers={"x-reflex-latency-ms": f"{ms:.1f}"})
+        headers = {
+            "x-reflex-latency-ms": f"{ms:.1f}",
+            "x-reflex-queue-ms": f"{wait_ms:.1f}",
+        }
+        return JSONResponse(resp.model_dump(), headers=headers)
 
     return app
 

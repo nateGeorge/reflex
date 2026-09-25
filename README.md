@@ -155,6 +155,13 @@ curl -s localhost:8008/v1/systemone -H 'content-type: application/json' -d '{
 The request and response shapes are the same as TypeSafe's hosted API, so client code
 written for Jev can point at `http://localhost:8008` instead.
 
+Requests are served one at a time -- one model instance, one accelerator -- but not in
+arrival order. The server runs the *cheapest* pending request first, so an interactive
+one-question call does not wait out a multi-question batch. A request that has waited
+more than five seconds is promoted ahead of newer arrivals, so batches cannot be starved
+by a steady stream of small calls. Each response carries `x-reflex-latency-ms` and
+`x-reflex-queue-ms` so queueing is visible from the client.
+
 ## Make the percentages honest (calibration)
 
 Out of the box the numbers are *roughly* right. To make them trustworthy for
