@@ -6,9 +6,11 @@ Supports ChatML-marker architectures (`qwen3`, `qwen3_5`, `llama`), plus
 (qwen4_exp/Flash-Next) need prompt-format and label-token work and are
 rejected at load.
 
-Loading passes ``trust_remote_code=True``: mlx-community quants such as
-Spark ship a custom tokenizer config that transformers refuses to run
-without it. Weights are local files; no remote code executes at inference.
+Loading passes ``trust_remote_code`` through ``tokenizer_config``: mlx-community
+quants such as Spark ship a custom tokenizer config that transformers refuses to
+run without it. Weights are local files; no remote code executes at inference.
+(mlx-lm >= 0.31 dropped the top-level ``trust_remote_code`` argument from
+``load``/``load_model``; passing it there raises TypeError.)
 """
 
 from __future__ import annotations
@@ -77,7 +79,6 @@ def _load_trusted(model_id):
         return load(
             model_id,
             return_config=True,
-            trust_remote_code=True,
             tokenizer_config={"trust_remote_code": True},
         )
     except Exception:
@@ -91,7 +92,7 @@ def _load_trusted(model_id):
 
         path = _Path(snapshot_download(model_id))
         config = load_config(path)
-        model, _ = load_model(path, trust_remote_code=True)
+        model, _ = load_model(path)
         return model, _DirectTokenizer(path), config
 
 
