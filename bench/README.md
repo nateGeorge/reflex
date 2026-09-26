@@ -7,7 +7,7 @@ workloads with the same `--n` and `--seed`, so numbers compare directly.
 
 | Name      | Type                 | Data                                                              |
 | --------- | -------------------- | ----------------------------------------------------------------- |
-| `smoke`   | `choice`, 2 options  | 14 auto-think routine/deep prompts x option orders x first/repeat |
+| `smoke`   | `choice`, 5 options  | 14 auto-think routine/deep prompts x option orders x first/repeat |
 | `banking` | `choice`, 10 options | Banking77 sample (1 true intent + 9 distractors)                  |
 | `sst2`    | `noul`               | SST-2 validation sample                                           |
 | `stars`   | `score`, 5 levels    | Amazon reviews (en) test sample, 1-5 stars                        |
@@ -25,7 +25,7 @@ state-prefix cache bug, not a threshold to tune.
 ## Run
 
 ```bash
-uv run python bench/suite.py --model $HOME/.local/share/reflex-mlx/models/qwen3-4b-4bit \
+uv run python bench/suite.py --model Qwen/Qwen3-4B \
     --out runs/bench-qwen3-4b.json
 ```
 
@@ -38,4 +38,12 @@ Options: `--n 200` (dataset sample size), `--seed 7`, `--backend mlx|torch`,
 - Fit calibration on train splits, report on test/validation splits.
 - The smoke suite stays the source of truth for the auto-think workload;
   public datasets measure general decision accuracy, not routine-vs-deep.
+- That workload lives in `bench/smoke.py` and is a copy of the question
+  pi-auto-think sends: the same instruction, the same criteria, and the five
+  levels `choiceLevels()` offers. It used to live outside the repo, which is why
+  the smoke leg could not be re-run after that directory was deleted. Re-copy it
+  when the extension's wording changes -- the wording moves the score, so a
+  stale copy measures a question nobody asks.
+- A `deep` case counts as correct only at `high`; `medium` there is the
+  under-rating this workload exists to catch, not a near miss.
 - Record the evidence JSON path alongside any reported number.
