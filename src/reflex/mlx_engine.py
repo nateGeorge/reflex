@@ -181,6 +181,7 @@ class MLXEngine:
         max_pack_tokens=8192,
         cache_entries=16,
         cache_bytes=6 * 1024**3,
+        default_permutations=1,
     ):
         if model.model_type not in SUPPORTED_MODEL_TYPES:
             raise ValueError(
@@ -202,6 +203,9 @@ class MLXEngine:
         self.device = mx.default_device()
         self.cal = calibration or Calibration()
         self.max_pack_tokens = max_pack_tokens
+        # A request may omit ``permutations``; the field then means "the server's
+        # setting", the same contract the torch engine implements.
+        self.default_permutations = default_permutations
         # Sized in bytes, because that is the real limit: one 20k-token state
         # is ~2.9 GB of KV. The entry count only keeps the short interactive
         # states that arrive between long ones from evicting them.
@@ -218,6 +222,7 @@ class MLXEngine:
         max_pack_tokens=8192,
         cache_entries=16,
         cache_bytes=6 * 1024**3,
+        default_permutations=1,
     ):
         if not mx.metal.is_available():
             raise RuntimeError("MLX backend needs an Apple Silicon GPU")
@@ -239,6 +244,7 @@ class MLXEngine:
             max_pack_tokens=max_pack_tokens,
             cache_entries=cache_entries,
             cache_bytes=cache_bytes,
+            default_permutations=default_permutations,
         )
 
     def _label_ids(self, labels):
@@ -341,10 +347,13 @@ class MLXEngine:
             no_think="enable_thinking" in (self.tok.chat_template or ""),
         )
         rng = random.Random(0)
+        # None is "the server's setting", not zero orders: coalesce exactly the way
+        # the torch engine does, or distinct_orders compares int to None.
+        permutations = req.permutations or self.default_permutations
         branches = [
             branch
             for qid, q in req.questions.items()
-            for branch in build_branches(qid, q, fmt, req.permutations, rng)
+            for branch in build_branches(qid, q, fmt, permutations, rng)
         ]
         # The state is tokenized once, as a prefix shared by every branch, and
         # its KV cache is computed once per request instead of once per branch.

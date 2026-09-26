@@ -306,7 +306,6 @@ def main(argv=None):
             "--ensemble": args.ensemble,
             "--prompt-texts": args.prompt_texts,
             "--prompt-style": args.prompt_style != "markdown",
-            "--permutations": args.permutations != 1,
             "--max-branch-tokens": args.max_branch_tokens != 4096,
         }
         given = [flag for flag, is_set in torch_only.items() if is_set]
@@ -320,6 +319,7 @@ def main(argv=None):
             max_pack_tokens=args.max_pack_tokens,
             cache_entries=args.cache_entries,
             cache_bytes=int(args.cache_gb * 1024**3),
+            default_permutations=args.permutations,
         )
     elif args.backend == "sglang":
         if args.require_fast_kernels:

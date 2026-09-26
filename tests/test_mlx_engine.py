@@ -183,6 +183,45 @@ def test_http_concurrent_requests_and_validation(engine):
         assert client.post("/v1/systemone", json=requests[0].model_dump()).status_code == 422
 
 
+def test_request_without_permutations_uses_server_default(engine):
+    """An omitted permutations field means "the server's setting", not None.
+
+    Regression: the field is optional in the schema, and None used to reach
+    distinct_orders, which compared int to None and returned 500.
+    """
+    body = request_for().model_dump()
+    body.pop("permutations")
+    with TestClient(create_app(engine)) as client:
+        response = client.post("/v1/systemone", json=body)
+    assert response.status_code == 200, response.text
+    baseline = engine.answer(request_for(permutations=1))
+    assert response.json()["usage"]["question_tokens"] == baseline.usage.question_tokens
+
+
+def test_default_permutations_is_configurable(engine):
+    """--permutations sets the default for requests that omit the field; an
+    explicit request value still wins."""
+    omitted = request_for().model_dump()
+    omitted.pop("permutations")
+    engine.default_permutations = 3
+    three = engine.answer(request_for(permutations=3))
+    assert (
+        engine.answer(SystemOneRequest(**omitted)).usage.question_tokens
+        == three.usage.question_tokens
+    )
+    one = engine.answer(request_for(permutations=1))
+    assert one.usage.question_tokens < three.usage.question_tokens
+
+
+def test_mlx_dispatch_passes_default_permutations(engine, monkeypatch):
+    """The mlx backend accepts --permutations and hands it to the engine."""
+    seen = {}
+    monkeypatch.setattr(MLXEngine, "load", lambda *args, **kwargs: seen.update(kwargs) or engine)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    main(["--backend", "mlx", "--permutations", "3"])
+    assert seen["default_permutations"] == 3
+
+
 def test_labels_and_branch_limits(engine, monkeypatch):
     """Multi-token labels and oversized question branches fail before inference."""
     monkeypatch.setattr(engine.tok, "encode", lambda *args, **kwargs: [1, 2])
