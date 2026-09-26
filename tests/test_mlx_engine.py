@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 mx = pytest.importorskip("mlx.core")
+from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.models.qwen3 import Model, ModelArgs
 
 from reflex.mlx_engine import MLXEngine, QuestionFirstFormat
@@ -76,37 +77,70 @@ def request_for(state="A duplicate invoice needs a refund.", permutations=1):
 
 
 def test_cache_matches_full_prompt_and_isolates_branches(engine):
-    """Cached multi-question readouts match uncached logits across states and permutations."""
+    """Reused prefixes match a private cache per branch, across states and permutations."""
     for state in ("A duplicate invoice needs a refund.", "A login error blocks access."):
         req = request_for(state, permutations=3)
         expected = {}
         rng = random.Random(0)
         fmt = QuestionFirstFormat(state=state)
+        prefix_ids = engine.tok.encode(fmt.prefix(state))
         for qid, q in req.questions.items():
             results = []
             for branch in build_branches(qid, q, fmt, req.permutations, rng):
+                # Reference: a fresh cache per branch, so nothing is shared and
+                # nothing is trimmed. A leak between branches shows up here.
+                cache = make_prompt_cache(engine.core)
+                engine.core(mx.array(prefix_ids)[None], cache=cache)
                 ids = engine.tok.encode(branch.text)
-                logits = engine.model(mx.array(ids)[None])[0, -1, engine._label_ids(branch.labels)]
-                results.append((branch, np.array(logits)))
+                logits = engine.core(mx.array(ids)[None], cache=cache)[0, -1]
+                results.append((branch, np.array(logits[engine._label_ids(branch.labels)])))
             expected[qid] = to_answer(q.type, merge_branches(q.type, results, engine.cal), q)
-        for _ in range(2):
+        for attempt in range(2):
             response = engine.answer(req)
             for qid, answer in response.answers.items():
+                # The reference projects the head over every branch position at
+                # once; the engine projects only the last. Different matmul
+                # shapes reassociate floats, which on an untrained model moves
+                # probabilities by ~5e-5. A wrong cache offset or a leaked
+                # branch would move them by O(0.1), so this stays meaningful.
                 if answer.type == "noul":
-                    assert answer.noul == pytest.approx(expected[qid].noul, abs=2e-5)
+                    assert answer.noul == pytest.approx(expected[qid].noul, abs=1e-3)
                 else:
                     np.testing.assert_allclose(
                         list(answer.probabilities.values()),
                         list(expected[qid].probabilities.values()),
-                        atol=2e-5,
+                        atol=1e-3,
                     )
             assert response.usage.output_tokens == 0
-            assert not response.usage.state_cache_hit
+            # The state prefix is computed once per request, then reused.
+            assert response.usage.state_cache_hit is (attempt == 1)
             assert response.usage.input_tokens == (
                 response.usage.state_tokens + response.usage.question_tokens
             )
-        assert len(engine.cache) <= 8
-        assert engine.cache.nbytes <= 128 * 1024**2
+        assert len(engine.cache) <= engine.cache.max_size
+        assert engine.cache.nbytes <= engine.cache.max_bytes
+
+
+def test_branches_share_one_state_prefix(engine):
+    """Branches differ only after the shared state, so they cost one cache entry."""
+    state = "A duplicate invoice needs a refund."
+    req = request_for(state, permutations=3)
+    fmt = QuestionFirstFormat(state=state)
+    rng = random.Random(0)
+    texts = [
+        branch.text
+        for qid, q in req.questions.items()
+        for branch in build_branches(qid, q, fmt, req.permutations, rng)
+    ]
+    assert len(texts) > 1
+    assert all(not t.startswith("# State") for t in texts)
+    assert all(state not in t for t in texts)
+
+    engine.answer(req)
+    assert len(engine.cache) == 1, "one state prefix, not one entry per branch"
+    # A second state adds exactly one more; the branches still add none.
+    engine.answer(request_for("A login error blocks access."))
+    assert len(engine.cache) == 2
 
 
 def test_http_concurrent_requests_and_validation(engine):
@@ -122,9 +156,14 @@ def test_http_concurrent_requests_and_validation(engine):
                 )
             )
         assert [r.status_code for r in responses] == [200, 200]
+        # Both states are new, so the first round misses the cache.
+        assert [r["usage"]["state_cache_hit"] for r in expected] == [False, False]
         for response, baseline in zip(responses, expected):
             actual = response.json()
-            assert actual["usage"] == baseline["usage"]
+            # Same numbers billed, but the second round reuses each state prefix.
+            assert actual["usage"]["state_cache_hit"] is True
+            for key in ("input_tokens", "state_tokens", "question_tokens"):
+                assert actual["usage"][key] == baseline["usage"][key]
             for qid, answer in actual["answers"].items():
                 before = baseline["answers"][qid]
                 if answer["type"] == "noul":

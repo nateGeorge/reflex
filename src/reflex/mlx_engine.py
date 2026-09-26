@@ -23,7 +23,7 @@ import mlx.core as mx
 import numpy as np
 from mlx import nn
 from mlx_lm import load
-from mlx_lm.models.cache import LRUPromptCache, make_prompt_cache
+from mlx_lm.models.cache import LRUPromptCache, make_prompt_cache, trim_prompt_cache
 
 from reflex.images import has_images
 from reflex.prompt import PromptFormat, build_branches, render_text
@@ -98,6 +98,15 @@ def _load_trusted(model_id):
 
 @dataclass
 class QuestionFirstFormat(PromptFormat):
+    """ChatML layout with the state in the shared prefix (see reflex.prompt).
+
+    Every branch of a request shares the system turn and the ``# State`` block
+    and differs only in the question that follows it. Keeping the state first is
+    what makes that sharing usable: a prefix cache is only reusable when the
+    common text is a prefix, so a layout that puts the state last forces a full
+    re-read of the state once per branch.
+    """
+
     state: Text = ""
 
     system_head: str = "<|im_start|>system\n"
@@ -106,16 +115,25 @@ class QuestionFirstFormat(PromptFormat):
     assistant_tail: str = "<|im_end|>\n<|im_start|>assistant\n"
     think_close: str = "<think>\n\n</think>\n\n"
 
-    def branch(self, body: str) -> str:
-        prefix = (
+    def prefix(self, state: Text | None = None) -> str:
+        """Shared prefix: the system turn, then the state under a ``# State`` header.
+
+        ``state`` defaults to the constructor field, so callers can build the
+        format up front and still render a prefix per request.
+        """
+        state = self.state if state is None else state
+        return (
             f"{self.system_head}{self.system_prompt}{self.system_tail}"
-            f"{self.user_head}"
+            f"{self.user_head}# State\n{render_text(state)}\n\n"
         )
-        body += f"\n# State\n{render_text(self.state)}\n\nRespond with only the option label.\n"
+
+    def branch(self, body: str) -> str:
+        """Per-branch suffix: the question and options, then the assistant turn."""
+        body += "\nRespond with only the option label.\n"
         tail = self.assistant_tail
         if self.no_think and self.think_close:
             tail += self.think_close
-        return prefix + body + tail
+        return body + tail
 
 
 @dataclass
@@ -161,6 +179,8 @@ class MLXEngine:
         model_name="reflex-latest",
         calibration=None,
         max_pack_tokens=8192,
+        cache_entries=16,
+        cache_bytes=6 * 1024**3,
     ):
         if model.model_type not in SUPPORTED_MODEL_TYPES:
             raise ValueError(
@@ -182,11 +202,23 @@ class MLXEngine:
         self.device = mx.default_device()
         self.cal = calibration or Calibration()
         self.max_pack_tokens = max_pack_tokens
-        self.cache = LRUPromptCache(max_size=8, max_bytes=128 * 1024**2)
+        # Sized in bytes, because that is the real limit: one 20k-token state
+        # is ~2.9 GB of KV. The entry count only keeps the short interactive
+        # states that arrive between long ones from evicting them.
+        self.cache = LRUPromptCache(max_size=cache_entries, max_bytes=cache_bytes)
         self._lock = threading.Lock()
+        self._trunk, self._head = self._split_model()
 
     @classmethod
-    def load(cls, model_id, *, calibration_path=None, max_pack_tokens=8192):
+    def load(
+        cls,
+        model_id,
+        *,
+        calibration_path=None,
+        max_pack_tokens=8192,
+        cache_entries=16,
+        cache_bytes=6 * 1024**3,
+    ):
         if not mx.metal.is_available():
             raise RuntimeError("MLX backend needs an Apple Silicon GPU")
         mx.set_default_device(mx.gpu)
@@ -205,6 +237,8 @@ class MLXEngine:
             model_name=model_id,
             calibration=Calibration.load(calibration_path),
             max_pack_tokens=max_pack_tokens,
+            cache_entries=cache_entries,
+            cache_bytes=cache_bytes,
         )
 
     def _label_ids(self, labels):
@@ -214,33 +248,78 @@ class MLXEngine:
                 raise ValueError(f"label {label!r} is not a single token: {tokens}")
         return mx.array([tokens[0] for tokens in ids])
 
-    def _vocab_size(self):
-        args = self.core.args
-        vocab = getattr(args, "vocab_size", None)
-        if vocab is None:
-            vocab = getattr(args, "text_config", {}).get("vocab_size")
-        return vocab
+    def _split_model(self):
+        """Split the model into ``(trunk, head)`` when that is provably equivalent.
 
-    def _logits(self, ids, labels):
-        label_ids = self._label_ids(labels)
-        # Leave a token to evaluate even when the cache already contains the whole prompt.
-        cache, rest = self.cache.fetch_nearest_cache(self.model_name, ids[:-1])
+        mlx-lm's ``Model.__call__`` is ``head(trunk(inputs, cache))``. Running the
+        halves separately keeps the output head -- a ``vocab_size``-wide
+        projection -- off the prompt positions. A 20k-token state otherwise
+        materializes a ``[1, 20000, 151936]`` logits tensor, several GB, to read
+        a single position, and it does that once per branch.
+
+        Checked against the model's own ``__call__`` at load, so an architecture
+        with a different layout falls back to the plain forward instead of
+        quietly computing something else.
+        """
+        trunk = getattr(self.core, "model", None)
+        if trunk is None:
+            return None, None
+        head = getattr(self.core, "lm_head", None)
+        if head is None:
+            head = getattr(getattr(trunk, "embed_tokens", None), "as_linear", None)
+        if head is None:
+            return None, None
+        ids = mx.array([[1, 2, 3]])
+        try:
+            full = self.core(ids)
+            split = head(trunk(ids))
+            mx.eval(full, split)
+        except Exception:
+            return None, None
+        if full.shape != split.shape or not mx.allclose(full, split, rtol=1e-2, atol=1e-2):
+            return None, None
+        return trunk, head
+
+    def _prefill(self, ids, cache):
+        """Run ``ids`` into ``cache``. The output is discarded, so skip the head."""
+        arr = mx.array(ids)[None]
+        if self._trunk is None:
+            self.core(arr, cache=cache)
+        else:
+            self._trunk(arr, cache=cache)
+
+    def _label_logits(self, ids, cache, labels):
+        """Readout logits for ``labels`` after appending ``ids`` to ``cache``.
+
+        Only the final position is projected. The caller trims ``ids`` back off
+        ``cache`` afterwards, so the shared prefix survives for the next branch.
+        """
+        arr = mx.array(ids)[None]
+        if self._trunk is None:
+            logits = self.core(arr, cache=cache)[:, -1:, :]
+        else:
+            logits = self._head(self._trunk(arr, cache=cache)[:, -1:, :])
+        restricted = logits[0, -1, self._label_ids(labels)].astype(mx.float32)
+        mx.eval(restricted)
+        return np.array(restricted)
+
+    def _state_cache(self, prefix_ids):
+        """KV cache covering the shared state prefix, reused by every branch.
+
+        Returns ``(cache, hit)``. The cache is private to the caller: branches
+        extend it and trim back. On a miss the caller inserts it into the LRU
+        once the branches are done, so a request never pays for a second copy of
+        a multi-gigabyte cache.
+        """
+        cache, rest = self.cache.fetch_nearest_cache(self.model_name, prefix_ids)
+        if cache is not None and not rest:
+            return cache, True
         if cache is None:
             cache = make_prompt_cache(self.core)
-        out = self.core(mx.array(rest + ids[-1:])[None], cache=cache)
-        if out.shape[-1] == self._vocab_size():
-            # Some architectures (spark2_5) return logits from __call__.
-            logits = out[:, -1:, :]
-        elif self.core.args.tie_word_embeddings:
-            hidden = hidden[:, -1:, :]
-            logits = self.core.model.embed_tokens.as_linear(hidden)
-        else:
-            hidden = hidden[:, -1:, :]
-            logits = self.core.lm_head(hidden)
-        restricted = logits[0, -1, label_ids].astype(mx.float32)
-        mx.eval(restricted, [c.state for c in cache])
-        self.cache.insert_cache(self.model_name, ids, cache)
-        return np.array(restricted)
+        if rest:
+            self._prefill(rest, cache)
+            mx.eval([c.state for c in cache])
+        return cache, False
 
     def answer(self, req: SystemOneRequest) -> SystemOneResponse:
         with self._lock:
@@ -267,30 +346,40 @@ class MLXEngine:
             for qid, q in req.questions.items()
             for branch in build_branches(qid, q, fmt, req.permutations, rng)
         ]
+        # The state is tokenized once, as a prefix shared by every branch, and
+        # its KV cache is computed once per request instead of once per branch.
+        prefix_ids = self.tok.encode(fmt.prefix(req.state), add_special_tokens=False)
         inputs = [self.tok.encode(b.text, add_special_tokens=False) for b in branches]
-        state_tokens = len(self.tok.encode(render_text(req.state), add_special_tokens=False))
         for ids in inputs:
-            if len(ids) > self.max_pack_tokens:
-                raise ValueError(f"prompt too long: {len(ids)} > {self.max_pack_tokens}")
-            if len(ids) - state_tokens > 4096:
+            if len(prefix_ids) + len(ids) > self.max_pack_tokens:
+                raise ValueError(
+                    f"prompt too long: {len(prefix_ids) + len(ids)} > {self.max_pack_tokens}"
+                )
+            if len(ids) > 4096:
                 raise ValueError("question branch too long: maximum 4096 tokens including framing")
+        cache, hit = self._state_cache(prefix_ids)
         per_q = {}
         for branch, ids in zip(branches, inputs):
-            logits = self._logits(ids, branch.labels)
+            logits = self._label_logits(ids, cache, branch.labels)
             per_q.setdefault(branch.qid, []).append((branch, logits))
+            # Back to the shared prefix, so the next branch starts at the same
+            # offset and reads the same KV entries.
+            trim_prompt_cache(cache, len(ids))
+        if not hit:
+            self.cache.insert_cache(self.model_name, prefix_ids, cache)
         answers = {
             qid: to_answer(q.type, merge_branches(q.type, per_q[qid], self.cal), q)
             for qid, q in req.questions.items()
         }
         total = sum(map(len, inputs))
-        state_total = state_tokens * len(branches)
+        state_total = len(prefix_ids) * len(branches)
         return SystemOneResponse(
             model=self.model_name,
             answers=answers,
             usage=Usage(
-                input_tokens=total,
+                input_tokens=state_total + total,
                 state_tokens=state_total,
-                question_tokens=total - state_total,
-                state_cache_hit=False,
+                question_tokens=total,
+                state_cache_hit=hit,
             ),
         )

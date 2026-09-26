@@ -31,7 +31,15 @@ def create_app(engine) -> FastAPI:
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "model": engine.model_name, "device": str(engine.device)}
+        cache = getattr(engine, "cache", None)
+        return {
+            "ok": True,
+            "model": engine.model_name,
+            "device": str(engine.device),
+            "cache": None
+            if cache is None
+            else {"entries": len(cache), "bytes": cache.nbytes, "max_bytes": cache.max_bytes},
+        }
 
     @app.post("/v1/systemone", response_model=SystemOneResponse)
     def systemone(req: SystemOneRequest):
@@ -76,6 +84,12 @@ def main(argv=None):
     ap.add_argument("--max-pack-tokens", type=int, default=8192)
     ap.add_argument("--backend", choices=["torch", "mlx"], default="torch")
     ap.add_argument("--warmup", help="SystemOne request JSON to evaluate before accepting traffic")
+    ap.add_argument(
+        "--cache-entries", type=int, default=16, help="max cached state prefixes (mlx backend)"
+    )
+    ap.add_argument(
+        "--cache-gb", type=float, default=6.0, help="state-prefix KV budget in GiB (mlx backend)"
+    )
     ap.add_argument("--dtype", default=None, choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--device", default=None, help="torch device_map (cuda, mps, cpu)")
     args = ap.parse_args(argv)
@@ -92,6 +106,8 @@ def main(argv=None):
             args.model or "Qwen/Qwen3-4B",
             calibration_path=args.calibration,
             max_pack_tokens=args.max_pack_tokens,
+            cache_entries=args.cache_entries,
+            cache_bytes=int(args.cache_gb * 1024**3),
         )
     else:
         from reflex.engine import Engine
