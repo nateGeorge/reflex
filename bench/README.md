@@ -46,4 +46,11 @@ Options: `--n 200` (dataset sample size), `--seed 7`, `--backend mlx|torch`,
   stale copy measures a question nobody asks.
 - A `deep` case counts as correct only at `high`; `medium` there is the
   under-rating this workload exists to catch, not a near miss.
+- For `smoke`, read the `production` summary, not `summary`. Only the forward
+  rows are the criteria order pi-auto-think sends; the reversed rows probe order
+  robustness and score lower (routine prompts drift up a level when the criteria
+  run high-to-low), so the average understates production.
+- Do not reorder the criteria to chase that probe. Six orders were measured on
+  this workload and the shipped cheapest-to-most-expensive order scored best
+  (13/14); `high` first, `off` last, and dropping `off` were all worse.
 - Record the evidence JSON path alongside any reported number.
