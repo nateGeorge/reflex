@@ -12,6 +12,7 @@ import gc
 import logging
 import os
 import time
+from pathlib import Path
 
 import torch
 from fastapi import FastAPI, HTTPException, Request
@@ -19,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from reflex.backends import BackendError
 from reflex.mps import is_out_of_memory
+from reflex.priority import PriorityLock, request_priority
 from reflex.schema import SystemOneRequest, SystemOneResponse
 
 log = logging.getLogger("reflex.server")
@@ -49,16 +51,26 @@ def create_app(engine, api_key: str | None = None) -> FastAPI:
             )
         return await call_next(request)
 
+    # One model instance on one accelerator: requests are serialized either way,
+    # but cheapest-first, so an interactive 1-question call never waits out a
+    # multi-question batch. See reflex.priority.
+    gate = PriorityLock()
+
     @app.get("/healthz")
     @app.get("/health")
     def healthz():
+        cache = getattr(engine, "cache", None)
         return {
             "ok": True,
             "status": "healthy",
             "model": engine.model_name,
             "calibration": engine.cal.temperature,
-            "strategy": engine.strategy,
+            # MLXEngine is the strategy and names none; torch and SGLang set one.
+            "strategy": getattr(engine, "strategy", None),
             "device": str(engine.device),
+            "cache": None
+            if cache is None
+            else {"entries": len(cache), "bytes": cache.nbytes, "max_bytes": cache.max_bytes},
         }
 
     @app.get("/v1/models")
@@ -70,10 +82,15 @@ def create_app(engine, api_key: str | None = None) -> FastAPI:
 
     @app.post("/v1/systemone", response_model=SystemOneResponse)
     def systemone(req: SystemOneRequest):
-        t0 = time.perf_counter()
+        # t0 is set inside the gate below, so the latency we report leaves the queue out.
         out_of_memory = False
+        queued_at = time.perf_counter()
+        wait_ms = 0.0
         try:
-            resp = engine.answer(req)
+            with gate.hold(request_priority(req)):
+                wait_ms = (time.perf_counter() - queued_at) * 1000
+                t0 = time.perf_counter()
+                resp = engine.answer(req)
         except ValueError as e:  # bad labels / too long
             raise HTTPException(status_code=422, detail=str(e))
         except BackendError as e:
@@ -100,17 +117,20 @@ def create_app(engine, api_key: str | None = None) -> FastAPI:
             raise HTTPException(status_code=529, detail="overloaded: request too large for GPU")
         ms = (time.perf_counter() - t0) * 1000
         log.info(
-            "%d questions, %d state tok (%s), %d q tok, %.0f ms",
+            "%d questions, %d state tok (%s), %d q tok, %.0f ms (queued %.0f ms)",
             len(req.questions),
             resp.usage.state_tokens,
             "hit" if resp.usage.state_cache_hit else "miss",
             resp.usage.question_tokens,
             ms,
+            wait_ms,
         )
+        headers = {
+            "x-reflex-latency-ms": f"{ms:.1f}",
+            "x-reflex-queue-ms": f"{wait_ms:.1f}",
+        }
         # exclude_none: optional fields that are unset stay out of the payload.
-        return JSONResponse(
-            resp.model_dump(exclude_none=True), headers={"x-reflex-latency-ms": f"{ms:.1f}"}
-        )
+        return JSONResponse(resp.model_dump(exclude_none=True), headers=headers)
 
     return app
 
@@ -132,7 +152,7 @@ def _sglang_backend(args):
     for flag, value in (("--adapter", args.adapter), ("--ensemble", args.ensemble)):
         if value:
             raise SystemExit(f"{flag} is not supported by --backend sglang")
-    if args.device != "cuda":
+    if args.device not in (None, "cuda"):
         raise SystemExit(
             "--device applies to the in-process model; --backend sglang holds no weights "
             "(the device is SGLang's, set when you launch its server)"
@@ -161,7 +181,11 @@ def _sglang_backend(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument(
+        "--model",
+        default=None,
+        help="model id; default Qwen/Qwen3.5-4B, or Qwen/Qwen3-4B for --backend mlx",
+    )
     ap.add_argument(
         "--adapter", default=None, help="LoRA adapter: a reflex-calibrate output dir or a hub id"
     )
@@ -208,9 +232,11 @@ def main(argv=None):
     ap.add_argument(
         "--backend",
         default="transformers",
-        choices=["transformers", "sglang"],
-        help="transformers: load the model in this process (the default). sglang: read the "
-        "same label logits off an SGLang server over HTTP (reflex.backends.sglang)",
+        choices=["transformers", "torch", "sglang", "mlx"],
+        help="transformers (alias torch): load the model in this process (the default). "
+        "sglang: read the same label logits off an SGLang server over HTTP "
+        "(reflex.backends.sglang). mlx: load the model on the Apple Silicon GPU "
+        "through MLX (reflex.mlx_engine)",
     )
     ap.add_argument(
         "--sglang-concurrency",
@@ -237,67 +263,114 @@ def main(argv=None):
         "in tokens. Anything longer is refused rather than cut. Raise it for suites that "
         "put a whole document in one question; the ceiling is the model's context window",
     )
-    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
-    ap.add_argument("--device", default="cuda", choices=["cuda", "mps", "cpu"])
+    ap.add_argument(
+        "--cache-entries", type=int, default=16, help="max cached state prefixes (mlx backend)"
+    )
+    ap.add_argument(
+        "--cache-gb", type=float, default=6.0, help="state-prefix KV budget in GiB (mlx backend)"
+    )
+    ap.add_argument(
+        "--warmup",
+        default=None,
+        help="SystemOne request JSON to evaluate before accepting traffic",
+    )
+    ap.add_argument(
+        "--dtype",
+        default=None,
+        choices=["bfloat16", "float16", "float32"],
+        help="torch dtype (default bfloat16); mlx reads the checkpoint's own",
+    )
+    ap.add_argument(
+        "--device",
+        default=None,
+        choices=["cuda", "mps", "cpu"],
+        help="torch device_map (default cuda)",
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     import uvicorn
 
-    from reflex.engine import Engine
-    from reflex.kernels import describe, kernel_report, require_fast_kernels
+    explicit_model = args.model is not None
+    if args.model is None:
+        # Each backend keeps the default it shipped with.
+        args.model = "Qwen/Qwen3-4B" if args.backend == "mlx" else "Qwen/Qwen3.5-4B"
 
-    if args.backend == "sglang":
+    if args.backend == "mlx":
+        if args.adapter or args.dtype or args.device:
+            ap.error("--adapter, --dtype and --device apply only to the torch backend")
+        # MLXEngine takes no server-side defaults for these, so refuse them rather than
+        # answer differently than asked. See reflex.mlx_engine.MLXEngine.load.
+        torch_only = {
+            "--stable": args.stable,
+            "--ensemble": args.ensemble,
+            "--prompt-texts": args.prompt_texts,
+            "--prompt-style": args.prompt_style != "markdown",
+            "--permutations": args.permutations != 1,
+            "--max-branch-tokens": args.max_branch_tokens != 4096,
+        }
+        given = [flag for flag, is_set in torch_only.items() if is_set]
+        if given:
+            ap.error(f"{', '.join(given)} not supported by --backend mlx")
+        from reflex.mlx_engine import MLXEngine
+
+        engine = MLXEngine.load(
+            args.model,
+            calibration_path=args.calibration,
+            max_pack_tokens=args.max_pack_tokens,
+            cache_entries=args.cache_entries,
+            cache_bytes=int(args.cache_gb * 1024**3),
+        )
+    elif args.backend == "sglang":
         if args.require_fast_kernels:
             raise SystemExit(
                 "--require-fast-kernels applies to the in-process model; --backend sglang "
                 "holds no weights here (check the kernels on the SGLang server instead)"
             )
         engine = _sglang_backend(args)
-        uvicorn.run(
-            create_app(engine, api_key=args.api_key),
-            host=args.host,
-            port=args.port,
-            log_level="warning",
-        )
-        return
-
-    if args.stable:
-        from reflex.serving import engine_kwargs, load_stable
-
-        kw = engine_kwargs(
-            load_stable(),
-            adapter_path=args.adapter,
-            calibration_path=args.calibration,
-            prompt_texts=args.prompt_texts,
-            prompt_style=args.prompt_style if args.prompt_style != "markdown" else None,
-            default_permutations=args.permutations if args.permutations != 1 else None,
-        )
-        if args.model != ap.get_default("model"):
-            kw["model_id"] = args.model
     else:
-        kw = {
-            "model_id": args.model,
-            "calibration_path": args.calibration,
-            "adapter_path": args.adapter,
-            "default_permutations": args.permutations,
-            "prompt_style": args.prompt_style,
-            "prompt_texts": args.prompt_texts,
-        }
-    engine = Engine.load(
-        dtype=getattr(torch, args.dtype),
-        device=args.device,
-        max_pack_tokens=args.max_pack_tokens,
-        max_branch_tokens=args.max_branch_tokens,
-        ensemble=args.ensemble,
-        **kw,
-    )
+        from reflex.engine import Engine
+        from reflex.kernels import describe, kernel_report, require_fast_kernels
+
+        if args.stable:
+            from reflex.serving import engine_kwargs, load_stable
+
+            kw = engine_kwargs(
+                load_stable(),
+                adapter_path=args.adapter,
+                calibration_path=args.calibration,
+                prompt_texts=args.prompt_texts,
+                prompt_style=args.prompt_style if args.prompt_style != "markdown" else None,
+                default_permutations=args.permutations if args.permutations != 1 else None,
+            )
+            if explicit_model:
+                kw["model_id"] = args.model
+        else:
+            kw = {
+                "model_id": args.model,
+                "calibration_path": args.calibration,
+                "adapter_path": args.adapter,
+                "default_permutations": args.permutations,
+                "prompt_style": args.prompt_style,
+                "prompt_texts": args.prompt_texts,
+            }
+        engine = Engine.load(
+            dtype=getattr(torch, args.dtype or "bfloat16"),
+            device=args.device or "cuda",
+            max_pack_tokens=args.max_pack_tokens,
+            max_branch_tokens=args.max_branch_tokens,
+            ensemble=args.ensemble,
+            **kw,
+        )
+        report = kernel_report(engine.model)
+        log.info("kernels: %s", describe(report))
+        if args.require_fast_kernels:
+            require_fast_kernels(report)
+
     if args.served_name:
         engine.model_name = args.served_name
-    report = kernel_report(engine.model)
-    log.info("kernels: %s", describe(report))
-    if args.require_fast_kernels:
-        require_fast_kernels(report)
+    if args.warmup:
+        engine.answer(SystemOneRequest.model_validate_json(Path(args.warmup).read_text()))
     uvicorn.run(
         create_app(engine, api_key=args.api_key),
         host=args.host,

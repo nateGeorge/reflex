@@ -3,7 +3,7 @@
 **A tiny "decision model" you can run on your own GPU.**
 
 You give it some information (a support ticket, a document, a photo) and a list of
-questions with fixed answer options. It answers *all* the questions at once and tells you
+questions with fixed answer options. It answers _all_ the questions at once and tells you
 **how sure it is about each option**, as percentages. It never writes free text, so it can
 never make up an answer that isn't on your list.
 
@@ -32,11 +32,11 @@ pass over a frozen open-weights model. No decoding, no reasoning, no escalation:
 
 **Where it stands.** On the public items of JevBench, against Jev itself:
 
-| | easy | standard | hard | hard ECE | latency |
-|---|---|---|---|---|---|
-| reflex, frozen Qwen3.5-4B, two orders (`stable`) | 1.000 | 0.917 | 0.685 | 0.081 | ~200 ms |
-| reflex, frozen Qwen3.8-27B, two orders | 1.000 | 0.958 | 0.766 | 0.061 | ~1 s |
-| Jev 1.13.0 (official) | 1.000 | 0.986 | 0.730 | 0.031 | |
+|                                                  | easy  | standard | hard  | hard ECE | latency |
+| ------------------------------------------------ | ----- | -------- | ----- | -------- | ------- |
+| reflex, frozen Qwen3.5-4B, two orders (`stable`) | 1.000 | 0.917    | 0.685 | 0.081    | ~200 ms |
+| reflex, frozen Qwen3.8-27B, two orders           | 1.000 | 0.958    | 0.766 | 0.061    | ~1 s    |
+| Jev 1.13.0 (official)                            | 1.000 | 0.986    | 0.730 | 0.031    |         |
 
 Ours are self-run numbers on a suite we have consulted throughout development. The
 **official JevBench v1.2 runs** (534 decisions including held-out items, run by the
@@ -71,8 +71,8 @@ quality: a frozen 0.8B is not a usable judge, and the model that ships is the 4B
 ## Why would I want this?
 
 Large chat models are great at reasoning but slow and expensive when all you need is a
-quick, structured judgment: *which queue, is this spam, how angry is this customer, does
-this photo match its caption*. A decision model:
+quick, structured judgment: _which queue, is this spam, how angry is this customer, does
+this photo match its caption_. A decision model:
 
 - **returns numbers, not prose** – nothing to parse, no JSON that fails to validate;
 - **answers many questions in one pass** – ask 20 questions about one document for
@@ -107,6 +107,30 @@ Try it on a photo:
 ```bash
 uv run python examples/image_triage.py path/to/photo.jpg --caption "two cats on a couch"
 ```
+
+### Apple Silicon (MLX)
+
+```bash
+uv sync --extra mlx
+uv run reflex-serve --backend mlx --model Qwen/Qwen3-4B --port 8008
+```
+
+The MLX backend supports text-only Qwen3 models on the Mac GPU. It quantizes
+unquantized weights to 4-bit; pre-quantized MLX checkpoints keep their precision.
+It places fixed questions before the variable state, caches matching token prefixes
+(up to eight entries / 128 MiB), and reads label logits without generating text.
+This prompt layout can change probabilities; check accuracy on your own inputs.
+
+Questions and permutations run serially, not in the Torch backend's packed batch.
+Use `--warmup request.json` with a representative SystemOne request to load GPU
+kernels and cache its question prefix before the server accepts traffic.
+Long states and uncached questions still cost a full prefill. The response schema
+stays the same. `state_cache_hit` stays false because this cache reuses question
+prefixes; token counts include each branch's state. Images return HTTP 422.
+`--adapter`, `--dtype`, and `--device` apply only to Torch. The default backend
+remains Torch. The server binds to localhost unless `--host` overrides it.
+
+Run the download-free MLX tests with `uv run --extra mlx --extra dev pytest tests/test_mlx_engine.py`.
 
 ### Ask your own questions
 
@@ -149,11 +173,11 @@ engine = Engine.load(**engine_kwargs(load_stable()))   # or Engine.load(..., def
 
 ### The three question types
 
-| type | asks | you get back |
-|---|---|---|
-| `noul` | "is this true?" | `noul`: probability of yes |
-| `choice` | "which one of these?" | `choice` (best option), `probabilities` for every option, `confidence` |
-| `score` | "how much, on this scale?" | `score` (weighted position), `probabilities` per level, `legend`, `confidence` |
+| type     | asks                       | you get back                                                                   |
+| -------- | -------------------------- | ------------------------------------------------------------------------------ |
+| `noul`   | "is this true?"            | `noul`: probability of yes                                                     |
+| `choice` | "which one of these?"      | `choice` (best option), `probabilities` for every option, `confidence`         |
+| `score`  | "how much, on this scale?" | `score` (weighted position), `probabilities` per level, `legend`, `confidence` |
 
 - `instructions` is the question. `criteria` are the options (choice), the ordered levels
   from low to high (score), or optional descriptions of what "yes" and "no" mean (noul).
@@ -184,6 +208,13 @@ written for Jev can point at `http://localhost:8008` instead.
 `--stable` reads the recommended settings from `serving/stable.json`; spell them out with
 `--model` and `--permutations` if you prefer. `--api-key` (or `REFLEX_API_KEY`) puts a
 bearer key in front of `/v1/*`, which you want on anything reachable from the internet.
+
+Requests are served one at a time -- one model instance, one accelerator -- but not in
+arrival order. The server runs the _cheapest_ pending request first, so an interactive
+one-question call does not wait out a multi-question batch. A request that has waited
+more than five seconds is promoted ahead of newer arrivals, so batches cannot be starved
+by a steady stream of small calls. Each response carries `x-reflex-latency-ms` and
+`x-reflex-queue-ms` so queueing is visible from the client.
 
 If your GPU is already running [SGLang](https://github.com/sgl-project/sglang), reflex can
 read the same label logits off it instead of loading the weights itself:
@@ -216,9 +247,22 @@ whose weights fit in roughly half of unified memory: MPS memory is capped so tha
 is too large fails with an out-of-memory error instead of swapping the machine to a halt
 (Qwen3.5-4B in float16 does not fit in 18 GB).
 
+There is also an MLX backend, which loads the model on the Apple Silicon GPU through
+[MLX](https://github.com/ml-explore/mlx) and keeps a state-prefix cache across requests
+(`--cache-entries`, `--cache-gb`):
+
+```bash
+uv sync --extra mlx
+uv run --no-sync reflex-serve --backend mlx --model Qwen/Qwen3-4B --port 8008
+```
+
+It takes `--calibration` and `--max-pack-tokens`. The torch-only flags (`--adapter`,
+`--dtype`, `--device`, `--stable`, `--ensemble`, `--prompt-texts`, `--prompt-style`,
+`--permutations`, `--max-branch-tokens`) are refused rather than ignored.
+
 ## Make the percentages honest (calibration)
 
-Out of the box the numbers are *roughly* right. To make them trustworthy for
+Out of the box the numbers are _roughly_ right. To make them trustworthy for
 thresholds, run the calibration check. It answers 1,200 exam questions and measures how
 well confidence matches accuracy:
 
@@ -229,10 +273,10 @@ uv run reflex-serve --calibration runs/calibration.json
 
 What we measured (lower ECE = more honest; Jev reports 0.031):
 
-| model | accuracy | honesty (ECE) before | after |
-|---|---|---|---|
-| Qwen3.5-4B | 72 % | 0.090 | **0.039** |
-| Qwen3-8B | 71 % | 0.264 | 0.061 |
+| model      | accuracy | honesty (ECE) before | after     |
+| ---------- | -------- | -------------------- | --------- |
+| Qwen3.5-4B | 72 %     | 0.090                | **0.039** |
+| Qwen3-8B   | 71 %     | 0.264                | 0.061     |
 
 The `stable` configuration ships **no** calibration file, because a temperature fitted on
 one distribution does not transfer to another, and reading each question in two option
@@ -250,7 +294,7 @@ the precision changes.
 > pay is the case below: **your own workload's labels**, where the data you train on is
 > the data you will see. The numbers in this section are in-distribution numbers.
 
-Temperature fixes over-confidence but cannot make the model *better* at a task. For that
+Temperature fixes over-confidence but cannot make the model _better_ at a task. For that
 you train it, and the recipe is simple: show it labelled examples and penalise it with a
 proper scoring rule (log loss or Brier), which is minimised only by the true
 probabilities. That is the supervised form of the "RLCD" training Jev uses.
@@ -258,8 +302,12 @@ probabilities. That is the supervised form of the "RLCD" training Jev uses.
 You need labelled data in the same shape as a request, one JSON object per line:
 
 ```json
-{"state": {"comment": "..."}, "questions": {"toxic": {"type": "noul", "instructions": "..."}},
- "labels": {"toxic": 0.67}, "source": "civil_comments"}
+{
+  "state": { "comment": "..." },
+  "questions": { "toxic": { "type": "noul", "instructions": "..." } },
+  "labels": { "toxic": 0.67 },
+  "source": "civil_comments"
+}
 ```
 
 Labels can be hard (`"billing"`, `true`, `2`) or **soft** (`0.67`, `{"billing": 0.7, "sales": 0.3}`)
@@ -277,11 +325,11 @@ uv run reflex-serve --adapter runs/lora-mix --calibration runs/lora-mix/calibrat
 
 What one epoch of that bought on Qwen3.5-4B (held-out, 200 items per source):
 
-| | accuracy | calibration error (ECE) |
-|---|---|---|
-| raw model | 62.7 % | 0.120 |
-| after LoRA | 76.8 % | 0.051 |
-| after LoRA + temperature | 76.8 % | **0.024** |
+|                          | accuracy | calibration error (ECE) |
+| ------------------------ | -------- | ----------------------- |
+| raw model                | 62.7 %   | 0.120                   |
+| after LoRA               | 76.8 %   | 0.051                   |
+| after LoRA + temperature | 76.8 %   | **0.024**               |
 
 Toxicity went from 50 % to 94 %, hallucination checks from 78 % to 99 %, code-review
 "needs a comment" from 50 % to 74 %. Per-source numbers and caveats are in
@@ -302,15 +350,16 @@ targets ([docs/DISTILLATION.md](docs/DISTILLATION.md)). That teacher may reason
 ## Example: triaging a pull request
 
 `examples/pr_review.py` is a small AI PR-review triage built on this: a PR-level state
-(title, description, files) answers *what kind of change, how risky, breaking, needs a
-migration, does the description match*, and every diff hunk answers *sensitive area,
+(title, description, files) answers _what kind of change, how risky, breaking, needs a
+migration, does the description match_, and every diff hunk answers _sensitive area,
 weakens error handling, debug leftovers, public API change, behaviour change, and how
-much a senior reviewer would want to look*. Code aggregates the numbers and prints the
+much a senior reviewer would want to look_. Code aggregates the numbers and prints the
 hunks to hand to a reasoning model or a human.
 
 ```bash
 uv run python examples/pr_review.py --repo pydantic/pydantic --pr 13824
 ```
+
 ```
 kind            feature    feature   98%  bugfix    1%  chore    0%
 risk            1.96 / 3   (max hunk needs-eyes 2.02 / 3)
@@ -322,6 +371,7 @@ escalate to a reasoning model / human (P(needs a careful read) >= 50%):
     81%  pydantic-core/src/serializers/type_serializers/counter.rs  ...    +164/-0
 1.2s PR level, 13.3s for 40 hunks
 ```
+
 The raw model already orders things sensibly; the point of the design is that the
 outputs are numbers, so thresholds are yours, and with your own history of reverted or
 hotfixed PRs the calibrator can be trained so "80 %" means 80 % on your codebase.
@@ -350,7 +400,7 @@ filed on JevBench and queued by its author (issues
 Fine-tuning turned out to be a trap for general use: the adapters trained here improved
 data that looked like their training data and cost accuracy on long, ambiguous inputs,
 and prompt optimisation with GEPA did the same in miniature. The numbers, the controls
-and the two prompt changes that *did* transfer are in
+and the two prompt changes that _did_ transfer are in
 [docs/results/frozen-vs-trained.md](docs/results/frozen-vs-trained.md); the public-item
 comparison is in [docs/results/jevbench-public.md](docs/results/jevbench-public.md).
 
@@ -363,7 +413,7 @@ this section: what was tried, what won, and what was thrown away.
 The state is run through the model once and its internal cache is kept. Every question is
 then run as a separate branch that can see the state but not the other questions, all in
 the same forward pass. Instead of letting the model write an answer, we look at what it
-*would* say next, keep only the answer labels (A, B, C …, and a lettered pair for
+_would_ say next, keep only the answer labels (A, B, C …, and a lettered pair for
 yes/no), and turn those scores into percentages. Each question is asked twice inside that
 same pass, with its options in two different orders, and the two readings are averaged,
 which is the cheapest accuracy and honesty we found. A single "temperature" number,
