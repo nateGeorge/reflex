@@ -1,7 +1,7 @@
 """Standard Reflex decision-model benchmark.
 
 Workloads (accuracy + latency each):
-  smoke    14 auto-think routine/deep prompts x option orders (choice, 2 options)
+  smoke    14 auto-think routine/deep prompts x option orders (choice, 5 options)
   banking  Banking77 sample: 1 true intent + 25 distractors (choice, 26 options)
   sst2     SST-2 sample (noul, positive/negative)
   stars    Yelp review sample, 1-5 stars (score, 5 ordered levels)
@@ -12,7 +12,7 @@ Datasets load from raw parquet via snapshot_download. HF_HUB_DISABLE_XET=1
 works around xet-backed repos. No `datasets` dependency.
 
 Usage:
-  uv run python bench/suite.py --model $HOME/.local/share/reflex-mlx/models/qwen3-4b-4bit \
+  uv run python bench/suite.py --model Qwen/Qwen3-4B \
       --out runs/bench-qwen3-4b.json [--n 200] [--backend mlx] [--permutations 2]
 
 Comparisons across models need identical --n/--seed/--permutations and the
@@ -26,10 +26,15 @@ import json
 import os
 import random
 import statistics
+import sys
 import time
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+# The smoke workload is vendored next to this file. Put bench/ on the path so the
+# leg imports it whether this file is run as a script or imported by a test.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reflex.schema import SystemOneRequest
 
@@ -127,10 +132,8 @@ def timed(engine, req: SystemOneRequest):
 
 
 def run_smoke(engine, perms: int):
-    import sys
-
-    sys.path.insert(0, str(Path.home() / ".local/share/reflex-mlx"))
-    from smoke import CASES, request_for
+    # Mirrors the question pi-auto-think sends; see bench/smoke.py.
+    from smoke import ACCEPT, CASES, request_for
 
     rows = []
     engine.answer(SystemOneRequest(**request_for("Warmup: show the current branch name.")))
@@ -148,7 +151,7 @@ def run_smoke(engine, perms: int):
                         "reverse": reverse,
                         "attempt": attempt,
                         "choice": ans.choice,
-                        "correct": ans.choice == expected,
+                        "correct": ans.choice in ACCEPT[expected],
                         "ms": round(ms, 1),
                     }
                 )
