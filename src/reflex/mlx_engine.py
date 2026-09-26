@@ -222,11 +222,19 @@ class MLXEngine:
         max_pack_tokens=8192,
         cache_entries=16,
         cache_bytes=6 * 1024**3,
+        cache_limit_bytes=2 * 1024**3,
         default_permutations=1,
     ):
         if not mx.metal.is_available():
             raise RuntimeError("MLX backend needs an Apple Silicon GPU")
         mx.set_default_device(mx.gpu)
+        # MLX's free-buffer cache defaults to the memory limit, which is 1.5x the
+        # recommended working set (~61 GiB on a 64 GB Mac). A server that churns
+        # multi-gigabyte prompt caches therefore keeps every freed buffer in the
+        # allocator instead of returning it, and the machine swaps while the cache
+        # holds memory nothing will reuse. Bound it: below the bound buffers are
+        # still reused, above it they go back to the OS.
+        mx.set_cache_limit(cache_limit_bytes)
         model, tokenizer, config = _load_trusted(model_id)
         model_type = config.get("model_type")
         if model_type not in SUPPORTED_MODEL_TYPES:

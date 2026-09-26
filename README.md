@@ -260,6 +260,13 @@ It takes `--calibration` and `--max-pack-tokens`. The torch-only flags (`--adapt
 `--dtype`, `--device`, `--stable`, `--ensemble`, `--prompt-texts`, `--prompt-style`,
 `--permutations`, `--max-branch-tokens`) are refused rather than ignored.
 
+It also caps MLX's own free-buffer cache (`--mlx-cache-limit-gb`, default 2). MLX defaults that
+ceiling to its memory limit — 1.5x the recommended working set, about 61 GiB on a 64 GB Mac — so
+every freed buffer, including the multi-gigabyte KV states this server churns through, stays in
+the allocator instead of going back to the OS. Below the ceiling buffers are still reused, which
+is what keeps steady-state latency flat; above it they are returned, which is what keeps a
+swapping machine from being pushed further into swap by memory nothing will reuse.
+
 ## Make the percentages honest (calibration)
 
 Out of the box the numbers are _roughly_ right. To make them trustworthy for
