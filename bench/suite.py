@@ -327,6 +327,16 @@ def run_prefix(engine, target_tokens: int = 20000):
     ]
 
 
+def production_rows(rows):
+    """The smoke rows that match what the extension actually sends.
+
+    `run_smoke` also runs every case with the criteria reversed, which probes
+    order robustness. Only the forward rows are the question pi-auto-think asks,
+    so averaging the two understates what production sees.
+    """
+    return [r for r in rows if not r["reverse"]]
+
+
 def summarize(rows, key="correct"):
     acc = sum(r[key] for r in rows) / len(rows) if rows else 0
     ms = sorted(r["ms"] for r in rows if "ms" in r)
@@ -380,6 +390,10 @@ def main():
         if name not in ("batch", "prefix"):
             out[name]["summary"] = summarize(rows)
             print(f"[{name}] {out[name]['summary']}", flush=True)
+            if name == "smoke":
+                # Forward order is the one the extension sends; see production_rows.
+                out[name]["production"] = summarize(production_rows(rows))
+                print(f"[{name}] production order {out[name]['production']}", flush=True)
         else:
             print(f"[{name}] {rows}", flush=True)
         Path(args.out).write_text(json.dumps(out, indent=2))

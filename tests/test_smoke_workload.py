@@ -119,6 +119,17 @@ def test_run_smoke_scores_against_the_accept_sets():
     assert routine_rows and not any(r["correct"] for r in routine_rows)
 
 
+def test_production_rows_are_the_forward_order_half():
+    rows = suite.run_smoke(_Engine("low"), 1)
+    production = suite.production_rows(rows)
+
+    assert len(production) == len(rows) // 2
+    assert all(r["reverse"] is False for r in production)
+    assert {r["case"] for r in production} == {name for name, _, _ in CASES}
+    # The reversed rows probe order robustness and must not be in the headline.
+    assert len(production) < len(rows)
+
+
 def test_run_smoke_sends_the_vendored_question_to_the_engine():
     engine = _Engine("medium")
     suite.run_smoke(engine, 1)
