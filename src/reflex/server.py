@@ -270,6 +270,14 @@ def main(argv=None):
         "--cache-gb", type=float, default=6.0, help="state-prefix KV budget in GiB (mlx backend)"
     )
     ap.add_argument(
+        "--mlx-cache-limit-gb",
+        type=float,
+        default=2.0,
+        help="MLX free-buffer cache ceiling in GiB (mlx backend). MLX defaults it to its memory "
+        "limit, ~1.5x the recommended working set (~61 GiB on a 64 GB Mac), which lets freed "
+        "prompt-cache buffers pile up in the allocator instead of returning to the OS",
+    )
+    ap.add_argument(
         "--warmup",
         default=None,
         help="SystemOne request JSON to evaluate before accepting traffic",
@@ -319,6 +327,7 @@ def main(argv=None):
             max_pack_tokens=args.max_pack_tokens,
             cache_entries=args.cache_entries,
             cache_bytes=int(args.cache_gb * 1024**3),
+            cache_limit_bytes=int(args.mlx_cache_limit_gb * 1024**3),
             default_permutations=args.permutations,
         )
     elif args.backend == "sglang":

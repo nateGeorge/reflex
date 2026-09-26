@@ -222,6 +222,37 @@ def test_mlx_dispatch_passes_default_permutations(engine, monkeypatch):
     assert seen["default_permutations"] == 3
 
 
+def test_mlx_dispatch_passes_cache_limit(engine, monkeypatch):
+    """--mlx-cache-limit-gb reaches the engine, and defaults to 2 GiB."""
+    seen = {}
+    monkeypatch.setattr(MLXEngine, "load", lambda *args, **kwargs: seen.update(kwargs) or engine)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    main(["--backend", "mlx", "--mlx-cache-limit-gb", "1.5"])
+    assert seen["cache_limit_bytes"] == int(1.5 * 1024**3)
+    main(["--backend", "mlx"])
+    assert seen["cache_limit_bytes"] == 2 * 1024**3
+
+
+def test_load_bounds_the_mlx_buffer_cache(engine, monkeypatch):
+    """load() sets MLX's buffer-cache ceiling instead of leaving the default.
+
+    MLX defaults it to the memory limit (1.5x the recommended working set), which
+    lets freed prompt-cache buffers accumulate instead of returning to the OS.
+    """
+    seen = {}
+    monkeypatch.setattr(
+        "reflex.mlx_engine._load_trusted",
+        lambda model_id: (
+            engine.model,
+            engine.tok,
+            {"model_type": "qwen3", "quantization": {"group_size": 64, "bits": 4}},
+        ),
+    )
+    monkeypatch.setattr(mx, "set_cache_limit", lambda limit: seen.update(limit=limit))
+    MLXEngine.load("tiny", cache_limit_bytes=512 * 1024**2)
+    assert seen["limit"] == 512 * 1024**2
+
+
 def test_labels_and_branch_limits(engine, monkeypatch):
     """Multi-token labels and oversized question branches fail before inference."""
     monkeypatch.setattr(engine.tok, "encode", lambda *args, **kwargs: [1, 2])
