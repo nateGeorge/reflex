@@ -6,6 +6,7 @@ Workloads (accuracy + latency each):
   sst2     SST-2 sample (noul, positive/negative)
   stars    Yelp review sample, 1-5 stars (score, 5 ordered levels)
   batch    1 state x 8 mixed questions in ONE request (multi-question throughput)
+  prefix   1 long state x 8 questions, cold vs warm (state-prefix cache reuse)
 
 Datasets load from raw parquet via snapshot_download. HF_HUB_DISABLE_XET=1
 works around xet-backed repos. No `datasets` dependency.
@@ -102,11 +103,18 @@ def _banking_label_names():
     return meta["info"]["features"]["label"]["names"]
 
 
-def load_engine(model: str, backend: str, calibration: str | None = None):
+def load_engine(
+    model: str,
+    backend: str,
+    calibration: str | None = None,
+    max_pack_tokens: int = 32768,
+):
     if backend == "mlx":
         from reflex.mlx_engine import MLXEngine
 
-        return MLXEngine.load(model, calibration_path=calibration)
+        # Match the server's --max-pack-tokens so the bench exercises the same
+        # limit production does.
+        return MLXEngine.load(model, calibration_path=calibration, max_pack_tokens=max_pack_tokens)
     from reflex import Engine
 
     return Engine.load(model)
@@ -133,9 +141,17 @@ def run_smoke(engine, perms: int):
                 req = SystemOneRequest(**body, permutations=perms)
                 resp, ms = timed(engine, req)
                 ans = resp.answers["thinking_need"]
-                rows.append({"case": name, "expected": expected, "reverse": reverse,
-                             "attempt": attempt, "choice": ans.choice,
-                             "correct": ans.choice == expected, "ms": round(ms, 1)})
+                rows.append(
+                    {
+                        "case": name,
+                        "expected": expected,
+                        "reverse": reverse,
+                        "attempt": attempt,
+                        "choice": ans.choice,
+                        "correct": ans.choice == expected,
+                        "ms": round(ms, 1),
+                    }
+                )
     return rows
 
 
@@ -154,17 +170,19 @@ def run_banking(engine, n: int, seed: int, perms: int):
         criteria = {o: o.replace("_", " ") for o in options}
         req = SystemOneRequest(
             state=item["text"],
-            questions={"intent": {
-                "type": "choice",
-                "instructions": "What is the customer's intent? Respond with only the letter.",
-                "criteria": criteria}},
+            questions={
+                "intent": {
+                    "type": "choice",
+                    "instructions": "What is the customer's intent? Respond with only the letter.",
+                    "criteria": criteria,
+                }
+            },
             permutations=perms,
         )
         resp, ms = timed(engine, req)
         probs = resp.answers["intent"].probabilities or {}
         got = max(probs, key=probs.get) if probs else None
-        out.append({"expected": true, "got": got, "correct": got == true,
-                    "ms": round(ms, 1)})
+        out.append({"expected": true, "got": got, "correct": got == true, "ms": round(ms, 1)})
     return out
 
 
@@ -178,16 +196,24 @@ def run_sst2(engine, n: int, seed: int, perms: int):
         expected = bool(item["label"])
         req = SystemOneRequest(
             state=item["sentence"],
-            questions={"pos": {
-                "type": "noul",
-                "instructions": "Is this review positive?",
-                "criteria": {"true": "positive sentiment", "false": "negative sentiment"}}},
+            questions={
+                "pos": {
+                    "type": "noul",
+                    "instructions": "Is this review positive?",
+                    "criteria": {"true": "positive sentiment", "false": "negative sentiment"},
+                }
+            },
             permutations=perms,
         )
         resp, ms = timed(engine, req)
-        out.append({"expected": expected, "got": resp.answers["pos"].noul,
-                    "correct": (resp.answers["pos"].noul >= 0.5) == expected,
-                    "ms": round(ms, 1)})
+        out.append(
+            {
+                "expected": expected,
+                "got": resp.answers["pos"].noul,
+                "correct": (resp.answers["pos"].noul >= 0.5) == expected,
+                "ms": round(ms, 1),
+            }
+        )
     return out
 
 
@@ -195,25 +221,39 @@ def run_stars(engine, n: int, seed: int, perms: int):
     rows = _parquet_rows("yelp_review_full", "yelp_review_full/test*.parquet")
     rng = random.Random(seed)
     idx = rng.sample(range(len(rows)), min(n, len(rows)))
-    levels = ["1 star: very bad", "2 stars: bad", "3 stars: okay",
-              "4 stars: good", "5 stars: excellent"]
+    levels = [
+        "1 star: very bad",
+        "2 stars: bad",
+        "3 stars: okay",
+        "4 stars: good",
+        "5 stars: excellent",
+    ]
     out = []
     for i in idx:
         item = rows[i]
         expected = int(item["label"])
         req = SystemOneRequest(
             state=str(item["text"])[:1000],
-            questions={"rating": {
-                "type": "score",
-                "instructions": "What star rating is this review? Respond with only the letter.",
-                "criteria": levels}},
+            questions={
+                "rating": {
+                    "type": "score",
+                    "instructions": "What star rating is this review? Respond with only the letter.",
+                    "criteria": levels,
+                }
+            },
             permutations=perms,
         )
         resp, ms = timed(engine, req)
         ans = resp.answers["rating"]
         got = ans.score if ans.score is not None else -1
-        out.append({"expected": expected, "got": got,
-                    "correct": round(got) == expected, "ms": round(ms, 1)})
+        out.append(
+            {
+                "expected": expected,
+                "got": got,
+                "correct": round(got) == expected,
+                "ms": round(ms, 1),
+            }
+        )
     return out
 
 
@@ -226,11 +266,62 @@ def run_batch(engine):
         for qid, q in BATCH_QUESTIONS.items():
             engine.answer(SystemOneRequest(state=state, questions={qid: q}))
         separate_ms = (time.perf_counter() - t0) * 1000
-        rows.append({"state": state[:40], "n_questions": len(BATCH_QUESTIONS),
-                     "one_request_ms": round(ms, 1),
-                     "separate_requests_ms": round(separate_ms, 1),
-                     "ms_per_question_batched": round(ms / len(BATCH_QUESTIONS), 1)})
+        rows.append(
+            {
+                "state": state[:40],
+                "n_questions": len(BATCH_QUESTIONS),
+                "one_request_ms": round(ms, 1),
+                "separate_requests_ms": round(separate_ms, 1),
+                "ms_per_question_batched": round(ms / len(BATCH_QUESTIONS), 1),
+            }
+        )
     return rows
+
+
+LONG_STATE_BLOCK = (
+    "Ticket update. The customer wrote in about their recent order and the "
+    "support agent replied with a summary of the account history. "
+)
+
+
+def _long_state(engine, target_tokens: int) -> str:
+    """Repeat neutral prose until the state reaches roughly target_tokens."""
+    state = ""
+    while len(engine.tok.encode(state, add_special_tokens=False)) < target_tokens:
+        state += LONG_STATE_BLOCK
+    return state
+
+
+def answers_key(resp) -> str:
+    """Stable serialisation of a response's answers, for cold-vs-warm equality."""
+    return json.dumps({qid: ans.model_dump() for qid, ans in resp.answers.items()}, sort_keys=True)
+
+
+def run_prefix(engine, target_tokens: int = 20000):
+    """Cost of one long shared state prefix, cold then warm.
+
+    The state prefix is the expensive part of a decision request and it is
+    shared by every branch, so it is read once and cached for the next request.
+    Answers must be identical either way: that is the regression guard for the
+    state-prefix cache.
+    """
+    state = _long_state(engine, target_tokens)
+    req = SystemOneRequest(state=state, questions=BATCH_QUESTIONS)
+    cold, cold_ms = timed(engine, req)
+    warm, warm_ms = timed(engine, req)
+    return [
+        {
+            "state_tokens": cold.usage.state_tokens,
+            "n_questions": len(BATCH_QUESTIONS),
+            "cold_ms": round(cold_ms, 1),
+            "warm_ms": round(warm_ms, 1),
+            "speedup": round(cold_ms / warm_ms, 2) if warm_ms else None,
+            "cold_cache_hit": cold.usage.state_cache_hit,
+            "warm_cache_hit": warm.usage.state_cache_hit,
+            "answers_identical": answers_key(cold) == answers_key(warm),
+            "cache_entries": len(engine.cache) if hasattr(engine, "cache") else None,
+        }
+    ]
 
 
 def summarize(rows, key="correct"):
@@ -238,8 +329,12 @@ def summarize(rows, key="correct"):
     ms = sorted(r["ms"] for r in rows if "ms" in r)
     med = statistics.median(ms) if ms else 0
     p95 = ms[min(len(ms) - 1, int(len(ms) * 0.95))] if ms else 0
-    return {"n": len(rows), "accuracy": round(acc, 4),
-            "median_ms": round(med, 1), "p95_ms": round(p95, 1)}
+    return {
+        "n": len(rows),
+        "accuracy": round(acc, 4),
+        "median_ms": round(med, 1),
+        "p95_ms": round(p95, 1),
+    }
 
 
 def main():
@@ -251,25 +346,35 @@ def main():
     ap.add_argument("--permutations", type=int, default=1)
     ap.add_argument("--backend", default="mlx", choices=["mlx", "torch"])
     ap.add_argument("--calibration", default=None)
+    ap.add_argument("--max-pack-tokens", type=int, default=32768)
+    ap.add_argument("--prefix-tokens", type=int, default=20000)
     ap.add_argument("--skip", default="")
     args = ap.parse_args()
     skip = set(args.skip.split(",")) if args.skip else set()
 
-    engine = load_engine(args.model, args.backend, args.calibration)
-    out = {"model": args.model, "backend": args.backend, "n": args.n,
-           "seed": args.seed, "permutations": args.permutations,
-           "calibration": args.calibration}
-    for name, fn in [("smoke", lambda: run_smoke(engine, args.permutations)),
-                     ("banking", lambda: run_banking(engine, args.n, args.seed, args.permutations)),
-                     ("sst2", lambda: run_sst2(engine, args.n, args.seed, args.permutations)),
-                     ("stars", lambda: run_stars(engine, args.n, args.seed, args.permutations)),
-                     ("batch", lambda: run_batch(engine))]:
+    engine = load_engine(args.model, args.backend, args.calibration, args.max_pack_tokens)
+    out = {
+        "model": args.model,
+        "backend": args.backend,
+        "n": args.n,
+        "seed": args.seed,
+        "permutations": args.permutations,
+        "calibration": args.calibration,
+    }
+    for name, fn in [
+        ("smoke", lambda: run_smoke(engine, args.permutations)),
+        ("banking", lambda: run_banking(engine, args.n, args.seed, args.permutations)),
+        ("sst2", lambda: run_sst2(engine, args.n, args.seed, args.permutations)),
+        ("stars", lambda: run_stars(engine, args.n, args.seed, args.permutations)),
+        ("batch", lambda: run_batch(engine)),
+        ("prefix", lambda: run_prefix(engine, args.prefix_tokens)),
+    ]:
         if name in skip:
             continue
         print(f"[{name}]...", flush=True)
         rows = fn()
         out[name] = {"rows": rows}
-        if name != "batch":
+        if name not in ("batch", "prefix"):
             out[name]["summary"] = summarize(rows)
             print(f"[{name}] {out[name]['summary']}", flush=True)
         else:
