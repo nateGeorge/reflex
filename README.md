@@ -132,6 +132,22 @@ remains Torch. The server binds to localhost unless `--host` overrides it.
 
 Run the download-free MLX tests with `uv run --extra mlx --extra dev pytest tests/test_mlx_engine.py`.
 
+#### Intern-Decision checkpoints
+
+[Intern-Decision](https://huggingface.co/collections/internlm/intern-decision) models are trained
+to answer every question in one forward pass over their own JSON-skeleton prompt. The MLX engine
+switches to that prompt when the tokenizer has the `<decision>` token, so the request and response
+stay the same. Convert and serve:
+
+```bash
+uv run --extra mlx python -m mlx_lm convert --hf-path internlm/Intern-Decision-2B \
+  --mlx-path models/intern-decision-2b-4bit -q --q-bits 4 --q-group-size 64
+uv run reflex-serve --backend mlx --model models/intern-decision-2b-4bit --port 8008
+```
+
+These checkpoints read the state once and ignore `permutations`. The prompt reproduces the
+upstream training format; changing it lowers accuracy. Conversion keeps the text model only.
+
 ### Ask your own questions
 
 ```python
