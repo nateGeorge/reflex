@@ -15,6 +15,7 @@ run without it. Weights are local files; no remote code executes at inference.
 
 from __future__ import annotations
 
+import copy
 import random
 import threading
 from dataclasses import dataclass
@@ -25,9 +26,10 @@ from mlx import nn
 from mlx_lm import load
 from mlx_lm.models.cache import LRUPromptCache, make_prompt_cache, trim_prompt_cache
 
+from reflex import intern_decision
 from reflex.images import has_images
 from reflex.prompt import PromptFormat, build_branches, render_text
-from reflex.readout import Calibration, merge_branches, to_answer
+from reflex.readout import Calibration, merge_branches, softmax, to_answer
 from reflex.schema import SystemOneRequest, SystemOneResponse, Text, Usage
 
 
@@ -50,9 +52,9 @@ class _DirectTokenizer:
         if template_file.exists():
             self.chat_template = template_file.read_text()
         else:
-            self.chat_template = _json.loads(
-                (path / "tokenizer_config.json").read_text()
-            ).get("chat_template")
+            self.chat_template = _json.loads((path / "tokenizer_config.json").read_text()).get(
+                "chat_template"
+            )
 
     def encode(self, text, add_special_tokens=False):
         return self._tok.encode(text, add_special_tokens=add_special_tokens).ids
@@ -61,10 +63,17 @@ class _DirectTokenizer:
         return self._tok.decode(ids)
 
 
-SUPPORTED_MODEL_TYPES = frozenset({
-    "qwen3", "qwen3_5", "llama", "spark2_5",
-    "mistral3", "ministral3", "gemma3n",
-})
+SUPPORTED_MODEL_TYPES = frozenset(
+    {
+        "qwen3",
+        "qwen3_5",
+        "llama",
+        "spark2_5",
+        "mistral3",
+        "ministral3",
+        "gemma3n",
+    }
+)
 
 # Spark sentence markers. Bars are U+FF5C FULLWIDTH VERTICAL LINE, blanks are
 # U+2581 LOWER ONE EIGHTH BLOCK. Copy verbatim; verified against the decoded
@@ -212,6 +221,9 @@ class MLXEngine:
         self.cache = LRUPromptCache(max_size=cache_entries, max_bytes=cache_bytes)
         self._lock = threading.Lock()
         self._trunk, self._head = self._split_model()
+        # Checkpoints trained with a decision token answer in one pass over their own
+        # prompt (reflex.intern_decision); the branch prompt is off-distribution for them.
+        self.decision_id = intern_decision.decision_token_id(tokenizer)
 
     @classmethod
     def load(
@@ -239,8 +251,7 @@ class MLXEngine:
         model_type = config.get("model_type")
         if model_type not in SUPPORTED_MODEL_TYPES:
             raise ValueError(
-                f"MLX backend supports {sorted(SUPPORTED_MODEL_TYPES)} models, "
-                f"got {model_type!r}"
+                f"MLX backend supports {sorted(SUPPORTED_MODEL_TYPES)} models, got {model_type!r}"
             )
         if not config.get("quantization"):
             nn.quantize(model, bits=4, group_size=64)
@@ -339,9 +350,64 @@ class MLXEngine:
         with self._lock:
             return self._answer(req)
 
+    def _decision_answer(self, req):
+        """One forward pass for all questions, read at each ``<decision>`` token.
+
+        Requests ignore ``permutations``: these checkpoints fix symbol order in training.
+        """
+        messages, fields = intern_decision.build_messages(req)
+        text = self.tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
+        )
+        ids = self.tok.encode(text, add_special_tokens=False)
+        if len(ids) > self.max_pack_tokens:
+            raise ValueError(f"prompt too long: {len(ids)} > {self.max_pack_tokens}")
+        # Cache through the state; only the schema and skeleton are re-read. Use the
+        # longest token prefix the split text shares with the full encoding, minus one
+        # token, so a merge across the boundary never changes the sequence.
+        head = self.tok.encode(
+            text[: text.index(intern_decision.SCHEMA_HEADER)], add_special_tokens=False
+        )
+        n = next((i for i, (a, b) in enumerate(zip(head, ids)) if a != b), len(head))
+        prefix_ids, suffix = ids[: max(n - 1, 0)], ids[max(n - 1, 0) :]
+        positions = [i - 1 for i, t in enumerate(suffix) if t == self.decision_id]
+        if len(positions) != len(fields) or min(positions) < 0:
+            raise ValueError("decision token count does not match the questions")
+        cache, hit = self._state_cache(prefix_ids)
+        if not hit:
+            # Store before the suffix pass: Qwen3.5's linear-attention state cannot be trimmed.
+            self.cache.insert_cache(self.model_name, prefix_ids, copy.deepcopy(cache))
+        arr = mx.array(suffix)[None]
+        index = mx.array(positions)
+        if self._trunk is None:
+            logits = self.core(arr, cache=cache)[0, index]
+        else:
+            logits = self._head(self._trunk(arr, cache=cache)[:, index, :])[0]
+        symbol_ids = [self._label_ids(f.symbols) for f in fields]
+        restricted = [logits[i, s].astype(mx.float32) for i, s in enumerate(symbol_ids)]
+        mx.eval(restricted)
+        answers = {}
+        for f, row in zip(fields, restricted):
+            q = req.questions[f.qid]
+            row = np.array(row)
+            probs = softmax(row, self.cal.t(q.type, row))
+            answers[f.qid] = to_answer(q.type, dict(zip(f.keys, map(float, probs))), q)
+        return SystemOneResponse(
+            model=self.model_name,
+            answers=answers,
+            usage=Usage(
+                input_tokens=len(ids),
+                state_tokens=len(prefix_ids),
+                question_tokens=len(suffix),
+                state_cache_hit=hit,
+            ),
+        )
+
     def _answer(self, req):
         if has_images(req.state):
             raise ValueError("state contains images but the loaded model is text-only")
+        if self.decision_id is not None:
+            return self._decision_answer(req)
         if self.model_type == "gemma3n":
             fmt_cls = GemmaFirstFormat
         elif self.model_type.startswith("mistral") or self.model_type.startswith("ministral"):
